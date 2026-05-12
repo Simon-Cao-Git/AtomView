@@ -8,6 +8,10 @@ let controls;
 let currentStructureGroup;
 let statusElement;
 let latestStructure;
+let hoverElement;
+let raycaster;
+let pointer;
+let atomMeshes = [];
 
 const BALL_RADIUS_SCALE = 0.4;
 const BOND_RADIUS = 0.06;
@@ -49,6 +53,23 @@ function initViewer() {
 	statusElement.style.display = 'none';
 	document.body.appendChild(statusElement);
 
+	hoverElement = document.createElement('pre');
+	hoverElement.style.position = 'absolute';
+	hoverElement.style.left = '16px';
+	hoverElement.style.bottom = '16px';
+	hoverElement.style.margin = '0';
+	hoverElement.style.padding = '8px 10px';
+	hoverElement.style.whiteSpace = 'pre-wrap';
+	hoverElement.style.fontFamily = 'var(--vscode-editor-font-family)';
+	hoverElement.style.fontSize = '12px';
+	hoverElement.style.color = 'var(--vscode-foreground)';
+	hoverElement.style.background = 'rgba(0, 0, 0, 0.70)';
+	hoverElement.style.border = '1px solid rgba(255, 255, 255, 0.25)';
+	hoverElement.style.borderRadius = '4px';
+	hoverElement.style.pointerEvents = 'none';
+	hoverElement.style.display = 'none';
+	document.body.appendChild(hoverElement);
+
 	scene = new THREE.Scene();
 	scene.background = new THREE.Color(0x000000);
 
@@ -62,6 +83,11 @@ function initViewer() {
 	controls = new OrbitControls(camera, renderer.domElement);
 	controls.enableDamping = false;
 	controls.screenSpacePanning = true;
+
+	raycaster = new THREE.Raycaster();
+	pointer = new THREE.Vector2();
+	renderer.domElement.addEventListener('pointermove', handlePointerMove);
+	renderer.domElement.addEventListener('pointerleave', clearHoverInfo);
 
 	scene.add(new THREE.AmbientLight(0xffffff, 0.85));
 
@@ -106,7 +132,9 @@ function renderStructure(structure) {
 }
 
 function drawAtoms(structure, group) {
-	for (const atom of structure.atoms) {
+	atomMeshes = [];
+	for (let index = 0; index < structure.atoms.length; index++) {
+		const atom = structure.atoms[index];
 		const element = getElementData(atom.element);
 		const radius = BALL_RADIUS_SCALE * element.covalentRadius;
 
@@ -126,9 +154,85 @@ function drawAtoms(structure, group) {
 
 		const sphere = new THREE.Mesh(geometry, material);
 		sphere.position.set(atom.position[0], atom.position[1], atom.position[2]);
+		sphere.userData.atom = atom;
+		sphere.userData.atomIndex = index;
+		sphere.userData.originalColor = atomColor.clone();
+		sphere.userData.isConstrained = isConstrained;
+		atomMeshes.push(sphere);
 
 		group.add(sphere);
 	}
+}
+
+function handlePointerMove(event) {
+	if (!camera || !raycaster || atomMeshes.length === 0) {
+		return;
+	}
+
+	const rect = renderer.domElement.getBoundingClientRect();
+	pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+	pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+	raycaster.setFromCamera(pointer, camera);
+	const intersections = raycaster.intersectObjects(atomMeshes, false);
+
+	resetAtomHoverAppearance();
+
+	if (intersections.length === 0) {
+		clearHoverInfo();
+		return;
+	}
+
+	const mesh = intersections[0].object;
+	const atom = mesh.userData.atom;
+	const atomIndex = mesh.userData.atomIndex;
+
+	mesh.scale.setScalar(1.18);
+	mesh.material.emissive = new THREE.Color(0x333333);
+
+	showAtomHoverInfo(atom, atomIndex);
+}
+
+function resetAtomHoverAppearance() {
+	for (const mesh of atomMeshes) {
+		mesh.scale.setScalar(1.0);
+		if (mesh.material) {
+			mesh.material.emissive = new THREE.Color(0x000000);
+		}
+	}
+}
+
+function clearHoverInfo() {
+	resetAtomHoverAppearance();
+	if (hoverElement) {
+		hoverElement.style.display = 'none';
+		hoverElement.textContent = '';
+	}
+}
+
+function showAtomHoverInfo(atom, atomIndex) {
+	const lines = [
+		`Atom ${atomIndex + 1}: ${atom.element}`,
+		`Cartesian: ${formatVector(atom.position)}`
+	];
+
+	if (atom.fractionalPosition) {
+		lines.push(`Fractional: ${formatVector(atom.fractionalPosition)}`);
+	}
+
+	if (Array.isArray(atom.selectiveDynamics)) {
+		const flags = atom.selectiveDynamics
+			.map((canMove) => canMove ? 'T' : 'F')
+			.join(' ');
+		lines.push(`Selective dynamics: ${flags}`);
+	}
+
+	hoverElement.textContent = lines.join('\n');
+	hoverElement.style.display = 'block';
+}
+
+function formatVector(vector) {
+	return vector.map((value) => value.toFixed(6)).join('  ');
 }
 
 function isAtomConstrained(atom) {
