@@ -11,7 +11,8 @@ The goal of this project is not to replace full-featured visualization software 
 ## Features
 
 - Live preview for POSCAR / CONTCAR files
-- Automatic refresh on file save
+- Selective dynamics tracking (frozen atoms will become translucent)
+- Automatic refresh on file change
 - Lightweight and workflow-oriented design
 
 ---
@@ -19,12 +20,10 @@ The goal of this project is not to replace full-featured visualization software 
 ## Planned Features
 
 - XDATCAR and trajectory visualization
-- Selective dynamics tracking
-- CUBE volumetric data support
-- Simple bond visualization
+- Additional structure data format support
 - Supercell generation
 - Atom picking and coordinate inspection
-- Camera alignment along lattice directions
+- More camera alignment controls
 
 ---
 

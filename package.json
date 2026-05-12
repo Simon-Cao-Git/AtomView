@@ -1,0 +1,53 @@
+{
+	"name": "atomview",
+	"description": "Lightweight live atomic structure preview for VASP POSCAR inside VS Code",
+	"version": "0.1.0",
+	"publisher": "purunc",
+	"private": true,
+	"license": "MIT",
+	"engines": {
+		"vscode": "^1.100.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [
+		"onCommand:atomview.openPreview"
+	],
+	"main": "./out/extension.js",
+	"contributes": {
+
+		"commands": [
+			{
+				"command": "atomview.openPreview",
+				"title": "Open AtomView Preview",
+				"category": "AtomView",
+				"icon": "$(open-preview)"
+			}
+		],
+		"menus": {
+			"editor/title": [
+				{
+					"command": "atomview.openPreview",
+					"group": "navigation",
+					"when": "resourceFilename == POSCAR || resourceFilename == CONTCAR || resourceExtname == .vasp"
+				}
+			]
+		}
+
+	},
+	"scripts": {
+		"vscode:prepublish": "npm run compile",
+		"compile": "tsc -p ./",
+		"watch": "tsc -w -p ./"
+	},
+	"devDependencies": {
+		"@types/node": "^22",
+		"@types/vscode": "^1.100.0",
+		"@types/vscode-webview": "^1.57.0",
+		"typescript": "^5.9.2"
+	},
+	"dependencies": {
+		"three": "^0.184.0"
+	}
+}
