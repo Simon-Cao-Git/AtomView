@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 
 type Vec3 = [number, number, number];
 
+type SourceFormat = 'POSCAR' | 'CONTCAR' | 'VASP' | 'XDATCAR';
+
 interface Atom {
 	element: string;
 	position: Vec3; // Cartesian coordinates in Angstrom
@@ -9,12 +11,24 @@ interface Atom {
 	selectiveDynamics?: [boolean, boolean, boolean];
 }
 
+interface TrajectoryFrame {
+	index: number;
+	atoms: Atom[];
+	coordinateMode: 'Direct' | 'Cartesian';
+}
+
 interface AtomicStructure {
 	title: string;
 	lattice: [Vec3, Vec3, Vec3];
 	atoms: Atom[];
 	coordinateMode: 'Direct' | 'Cartesian';
-	sourceFormat: 'POSCAR' | 'CONTCAR' | 'VASP';
+	sourceFormat: SourceFormat;
+	frames?: TrajectoryFrame[];
+}
+
+interface ParsedPoscarBlock {
+	structure: AtomicStructure;
+	nextLineIndex: number;
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -74,10 +88,7 @@ class AtomViewPanel {
 		this.sourceDocumentUri =
 			sourceUri ?? vscode.window.activeTextEditor?.document.uri;
 
-		this.panel.webview.html = this.getHtmlForWebview(
-			this.panel.webview
-		);
-
+		this.panel.webview.html = this.getHtmlForWebview(this.panel.webview);
 		this.updateFromSourceDocument();
 
 		this.panel.onDidDispose(
@@ -90,8 +101,7 @@ class AtomViewPanel {
 			(event) => {
 				if (
 					this.sourceDocumentUri &&
-					event.document.uri.toString() ===
-						this.sourceDocumentUri.toString()
+					event.document.uri.toString() === this.sourceDocumentUri.toString()
 				) {
 					this.updateFromDocument(event.document);
 				}
@@ -113,14 +123,12 @@ class AtomViewPanel {
 
 	private async updateFromSourceDocument() {
 		const document = this.sourceDocumentUri
-			? await vscode.workspace.openTextDocument(
-					this.sourceDocumentUri
-				)
+			? await vscode.workspace.openTextDocument(this.sourceDocumentUri)
 			: undefined;
 
 		if (!document) {
 			this.postStatus(
-				'Open a POSCAR, CONTCAR, or .vasp file to preview it.'
+				'Open a POSCAR, CONTCAR, XDATCAR, or .vasp file to preview it.'
 			);
 			return;
 		}
@@ -129,32 +137,33 @@ class AtomViewPanel {
 	}
 
 	private updateFromDocument(document: vscode.TextDocument) {
-		const fileName =
-			document.fileName.split(/[\\/]/).pop() ?? '';
-
+		const fileName = document.fileName.split(/[\\/]/).pop() ?? '';
 		const normalizedFileName = fileName.toUpperCase();
 
 		const isSupportedFile =
 			normalizedFileName === 'POSCAR' ||
 			normalizedFileName === 'CONTCAR' ||
+			normalizedFileName === 'XDATCAR' ||
 			normalizedFileName.endsWith('.VASP');
 
 		if (!isSupportedFile) {
 			this.postStatus(
-				`Source file is ${fileName}. Open POSCAR, CONTCAR, or a .vasp file to preview a structure.`
+				`Source file is ${fileName}. Open POSCAR, CONTCAR, XDATCAR, or a .vasp file to preview a structure.`
 			);
 			return;
 		}
 
 		try {
-			const sourceFormat =
+			const sourceFormat: SourceFormat =
 				normalizedFileName === 'POSCAR'
 					? 'POSCAR'
 					: normalizedFileName === 'CONTCAR'
 						? 'CONTCAR'
-						: 'VASP';
+						: normalizedFileName === 'XDATCAR'
+							? 'XDATCAR'
+							: 'VASP';
 
-			const structure = parsePoscar(
+			const structure = parseStructureFile(
 				document.getText(),
 				sourceFormat
 			);
@@ -281,21 +290,248 @@ class AtomViewPanel {
 	}
 }
 
-function parsePoscar(
+function parseStructureFile(
 	text: string,
-	sourceFormat: 'POSCAR' | 'CONTCAR' | 'VASP'
+	sourceFormat: SourceFormat
 ): AtomicStructure {
 	const lines = text
 		.split(/\r?\n/)
 		.map((line) => line.trim())
 		.filter((line) => line.length > 0);
 
+	if (looksLikeXdatcar(lines)) {
+		return parseXdatcar(lines, sourceFormat);
+	}
+
+	const structures = parseStackedPoscars(lines, sourceFormat);
+
+	if (structures.length === 0) {
+		throw new Error('No valid POSCAR/CONTCAR structure block was found.');
+	}
+
+	if (structures.length === 1) {
+		return structures[0];
+	}
+
+	const firstStructure = structures[0];
+
+	const frames: TrajectoryFrame[] = structures.map((structure, index) => ({
+		index: index + 1,
+		atoms: structure.atoms,
+		coordinateMode: structure.coordinateMode
+	}));
+
+	return {
+		...firstStructure,
+		sourceFormat,
+		atoms: frames[0].atoms,
+		coordinateMode: frames[0].coordinateMode,
+		frames
+	};
+}
+
+function looksLikeXdatcar(lines: string[]): boolean {
+	return lines.some((line) => /^direct\s+configuration\s*=/i.test(line));
+}
+
+function parseXdatcar(
+	lines: string[],
+	sourceFormat: SourceFormat
+): AtomicStructure {
+	if (lines.length < 8) {
+		throw new Error('File is too short to be a valid XDATCAR.');
+	}
+
+	const title = lines[0];
+	const scale = parseFloat(lines[1]);
+
+	if (!Number.isFinite(scale)) {
+		throw new Error('Invalid XDATCAR scaling factor.');
+	}
+
+	const rawLattice = [
+		parseVector(lines[2]),
+		parseVector(lines[3]),
+		parseVector(lines[4])
+	] as [Vec3, Vec3, Vec3];
+
+	const lattice = rawLattice.map((vector) =>
+		scaleVector(vector, scale)
+	) as [Vec3, Vec3, Vec3];
+
+	const elementSymbols = lines[5].split(/\s+/);
+
+	const elementCounts = lines[6]
+		.split(/\s+/)
+		.map((value) => parseInt(value, 10));
+
+	validateElementList(elementSymbols, elementCounts);
+
+	const totalAtoms = elementCounts.reduce((sum, count) => sum + count, 0);
+	const expandedElements = expandElementSymbols(elementSymbols, elementCounts);
+
+	const frames: TrajectoryFrame[] = [];
+	let lineIndex = 7;
+
+	while (lineIndex < lines.length) {
+		const header = lines[lineIndex];
+		const match = header.match(/^direct\s+configuration\s*=\s*(\d+)/i);
+
+		if (!match) {
+			lineIndex += 1;
+			continue;
+		}
+
+		const frameIndex = parseInt(match[1], 10);
+		const firstAtomLineIndex = lineIndex + 1;
+
+		if (lines.length < firstAtomLineIndex + totalAtoms) {
+			break;
+		}
+
+		const atoms: Atom[] = [];
+
+		for (let i = 0; i < totalAtoms; i++) {
+			const atomLine = lines[firstAtomLineIndex + i];
+			const fractionalPosition = parseVector(atomLine);
+			const element = expandedElements[i];
+
+			atoms.push({
+				element,
+				fractionalPosition,
+				position: fractionalToCartesian(fractionalPosition, lattice)
+			});
+		}
+
+		frames.push({
+			index: frameIndex,
+			atoms,
+			coordinateMode: 'Direct'
+		});
+
+		lineIndex = firstAtomLineIndex + totalAtoms;
+	}
+
+	if (frames.length === 0) {
+		throw new Error('No XDATCAR configuration frames were found.');
+	}
+
+	return {
+		title,
+		lattice,
+		atoms: frames[0].atoms,
+		coordinateMode: 'Direct',
+		sourceFormat: sourceFormat === 'VASP' ? 'VASP' : 'XDATCAR',
+		frames
+	};
+}
+
+function parseStackedPoscars(
+	lines: string[],
+	sourceFormat: SourceFormat
+): AtomicStructure[] {
+	const structures: AtomicStructure[] = [];
+	let lineIndex = 0;
+
+	while (lineIndex < lines.length) {
+		const parsedBlock = tryParsePoscarBlock(lines, lineIndex, sourceFormat);
+
+		if (parsedBlock) {
+			structures.push(parsedBlock.structure);
+			lineIndex = parsedBlock.nextLineIndex;
+			continue;
+		}
+
+		lineIndex += 1;
+	}
+
+	return structures;
+}
+
+function tryParsePoscarBlock(
+	lines: string[],
+	startLineIndex: number,
+	sourceFormat: SourceFormat
+): ParsedPoscarBlock | undefined {
+	if (lines.length - startLineIndex < 8) {
+		return undefined;
+	}
+
+	const scale = parseFloat(lines[startLineIndex + 1]);
+
+	if (!Number.isFinite(scale)) {
+		return undefined;
+	}
+
+	try {
+		parseVector(lines[startLineIndex + 2]);
+		parseVector(lines[startLineIndex + 3]);
+		parseVector(lines[startLineIndex + 4]);
+	} catch {
+		return undefined;
+	}
+
+	const elementSymbols = lines[startLineIndex + 5].split(/\s+/);
+
+	const elementCounts = lines[startLineIndex + 6]
+		.split(/\s+/)
+		.map((value) => parseInt(value, 10));
+
+	try {
+		validateElementList(elementSymbols, elementCounts);
+	} catch {
+		return undefined;
+	}
+
+	let coordinateLineIndex = startLineIndex + 7;
+	let coordinateModeLine = lines[coordinateLineIndex]?.toLowerCase() ?? '';
+
+	if (coordinateModeLine.startsWith('s')) {
+		coordinateLineIndex += 1;
+		coordinateModeLine = lines[coordinateLineIndex]?.toLowerCase() ?? '';
+	}
+
+	if (
+		!coordinateModeLine.startsWith('d') &&
+		!coordinateModeLine.startsWith('c') &&
+		!coordinateModeLine.startsWith('k')
+	) {
+		return undefined;
+	}
+
+	const totalAtoms = elementCounts.reduce((sum, count) => sum + count, 0);
+	const firstAtomLineIndex = coordinateLineIndex + 1;
+
+	if (lines.length < firstAtomLineIndex + totalAtoms) {
+		return undefined;
+	}
+
+	for (let i = 0; i < totalAtoms; i++) {
+		try {
+			parseVector(lines[firstAtomLineIndex + i]);
+		} catch {
+			return undefined;
+		}
+	}
+
+	const blockLines = lines.slice(startLineIndex, firstAtomLineIndex + totalAtoms);
+	const structure = parseSinglePoscarBlock(blockLines, sourceFormat);
+
+	return {
+		structure,
+		nextLineIndex: firstAtomLineIndex + totalAtoms
+	};
+}
+
+function parseSinglePoscarBlock(
+	lines: string[],
+	sourceFormat: SourceFormat
+): AtomicStructure {
 	if (lines.length < 8) {
 		throw new Error('File is too short to be a valid POSCAR/CONTCAR/.vasp file.');
 	}
 
 	const title = lines[0];
-
 	const scale = parseFloat(lines[1]);
 
 	if (!Number.isFinite(scale)) {
@@ -318,12 +554,7 @@ function parsePoscar(
 		.split(/\s+/)
 		.map((value) => parseInt(value, 10));
 
-	if (
-		elementSymbols.length !== elementCounts.length ||
-		elementCounts.some((count) => !Number.isInteger(count) || count < 0)
-	) {
-		throw new Error('Invalid element symbols or atom counts.');
-	}
+	validateElementList(elementSymbols, elementCounts);
 
 	let coordinateLineIndex = 7;
 	let hasSelectiveDynamics = false;
@@ -340,17 +571,13 @@ function parsePoscar(
 		coordinateModeLine.startsWith('d') ? 'Direct' : 'Cartesian';
 
 	const firstAtomLineIndex = coordinateLineIndex + 1;
-
 	const totalAtoms = elementCounts.reduce((sum, count) => sum + count, 0);
 
 	if (lines.length < firstAtomLineIndex + totalAtoms) {
 		throw new Error(`Expected ${totalAtoms} atomic coordinate lines, but found fewer.`);
 	}
 
-	const expandedElements = elementSymbols.flatMap((symbol, index) =>
-		Array(elementCounts[index]).fill(symbol)
-	);
-
+	const expandedElements = expandElementSymbols(elementSymbols, elementCounts);
 	const atoms: Atom[] = [];
 
 	for (let i = 0; i < totalAtoms; i++) {
@@ -386,6 +613,21 @@ function parsePoscar(
 		coordinateMode,
 		sourceFormat
 	};
+}
+
+function validateElementList(elementSymbols: string[], elementCounts: number[]) {
+	if (
+		elementSymbols.length !== elementCounts.length ||
+		elementCounts.some((count) => !Number.isInteger(count) || count < 0)
+	) {
+		throw new Error('Invalid element symbols or atom counts.');
+	}
+}
+
+function expandElementSymbols(elementSymbols: string[], elementCounts: number[]): string[] {
+	return elementSymbols.flatMap((symbol, index) =>
+		Array(elementCounts[index]).fill(symbol)
+	);
 }
 
 function parseVector(line: string): Vec3 {

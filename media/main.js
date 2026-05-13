@@ -6,6 +6,7 @@ let camera;
 let renderer;
 let controls;
 let currentStructureGroup;
+let currentBondGroup;
 let statusElement;
 let latestStructure;
 let hoverElement;
@@ -20,12 +21,22 @@ let axisCamera;
 let latticeAxisGroup;
 let isPerspectiveMode = false;
 let currentViewVectorIndex = 2;
+let currentFrameIndex = 0;
+let frameSliderContainer;
+let frameSlider;
+let frameLabel;
+let playPauseButton;
+let playbackTimer;
+let isPlayingTrajectory = false;
 
 const BALL_RADIUS_SCALE = 0.4;
 const BOND_RADIUS = 0.06;
 const DASHED_BOND_RADIUS = 0.035;
 const DASH_SEGMENT_LENGTH = 0.16;
 const DASH_GAP_LENGTH = 0.10;
+const SLOWEST_PLAYBACK_INTERVAL_MS = 300;
+const FASTEST_PLAYBACK_INTERVAL_MS = 30;
+const TARGET_TRAJECTORY_LOOP_SECONDS = 30;
 
 initViewer();
 
@@ -39,9 +50,21 @@ window.addEventListener('message', (event) => {
 
 	if (message.command === 'showStructure') {
 		const hadStructure = Boolean(latestStructure);
+		const previousFrameIndex = currentFrameIndex;
 		latestStructure = message.structure;
+
+		if (!hadStructure) {
+			currentFrameIndex = 0;
+		} else {
+			const frameCount = Array.isArray(latestStructure.frames)
+				? latestStructure.frames.length
+				: 1;
+			currentFrameIndex = Math.min(previousFrameIndex, Math.max(frameCount - 1, 0));
+		}
+
 		showStatus('');
-		renderStructure(latestStructure, { preserveCamera: hadStructure });
+		updateFrameSlider();
+		renderCurrentFrame({ preserveCamera: hadStructure });
 	}
 });
 
@@ -140,6 +163,58 @@ function initViewer() {
 	addCameraButton('c', () => setCameraAlongLatticeVector(2));
 	addCameraButton('ortho', toggleCameraProjection);
 
+	frameSliderContainer = document.createElement('div');
+	frameSliderContainer.style.position = 'absolute';
+	frameSliderContainer.style.left = '16px';
+	frameSliderContainer.style.top = '16px';
+	frameSliderContainer.style.display = 'none';
+	frameSliderContainer.style.alignItems = 'center';
+	frameSliderContainer.style.gap = '6px';
+	frameSliderContainer.style.padding = '5px 8px';
+	frameSliderContainer.style.border = '1px solid rgba(255, 255, 255, 0.25)';
+	frameSliderContainer.style.borderRadius = '6px';
+	frameSliderContainer.style.background = 'rgba(0, 0, 0, 0.70)';
+	frameSliderContainer.style.color = 'var(--vscode-foreground)';
+	frameSliderContainer.style.fontFamily = 'var(--vscode-font-family)';
+	frameSliderContainer.style.fontSize = '11px';
+	frameSliderContainer.style.zIndex = '12';
+	document.body.appendChild(frameSliderContainer);
+
+	playPauseButton = document.createElement('button');
+	playPauseButton.textContent = '▶';
+	playPauseButton.title = 'Play trajectory';
+	playPauseButton.style.minWidth = '24px';
+	playPauseButton.style.height = '22px';
+	playPauseButton.style.border = '1px solid rgba(255, 255, 255, 0.35)';
+	playPauseButton.style.borderRadius = '4px';
+	playPauseButton.style.color = 'var(--vscode-foreground)';
+	playPauseButton.style.background = 'rgba(0, 0, 0, 0.65)';
+	playPauseButton.style.cursor = 'pointer';
+	playPauseButton.style.fontFamily = 'var(--vscode-font-family)';
+	playPauseButton.style.fontSize = '11px';
+	playPauseButton.addEventListener('click', toggleTrajectoryPlayback);
+	frameSliderContainer.appendChild(playPauseButton);
+
+	frameSlider = document.createElement('input');
+	frameSlider.type = 'range';
+	frameSlider.min = '0';
+	frameSlider.max = '0';
+	frameSlider.step = '1';
+	frameSlider.value = '0';
+	frameSlider.style.width = '140px';
+	frameSlider.addEventListener('input', () => {
+		currentFrameIndex = Number(frameSlider.value);
+		updateFrameLabel();
+		renderCurrentFrame({ preserveCamera: true });
+	});
+	frameSliderContainer.appendChild(frameSlider);
+
+	frameLabel = document.createElement('span');
+	frameLabel.textContent = 'Frame 1 / 1';
+	frameLabel.style.minWidth = '64px';
+	frameLabel.style.textAlign = 'right';
+	frameSliderContainer.appendChild(frameLabel);
+
 	scene = new THREE.Scene();
 	scene.background = new THREE.Color(0x000000);
 
@@ -169,7 +244,7 @@ function initViewer() {
 	window.addEventListener('resize', () => {
 		renderer.setSize(window.innerWidth, window.innerHeight);
 		if (latestStructure) {
-			fitCameraToStructure(latestStructure, currentViewVectorIndex);
+			fitCameraToStructure(getCurrentFrameStructure(), currentViewVectorIndex);
 		}
 	});
 
@@ -320,7 +395,7 @@ function setCameraAlongLatticeVector(latticeVectorIndex) {
 		return;
 	}
 	currentViewVectorIndex = latticeVectorIndex;
-	fitCameraToStructure(latestStructure, latticeVectorIndex);
+	fitCameraToStructure(getCurrentFrameStructure(), latticeVectorIndex);
 }
 
 function toggleCameraProjection() {
@@ -341,7 +416,7 @@ function toggleCameraProjection() {
 	controls.target.set(0, 0, 0);
 
 	if (latestStructure) {
-		fitCameraToStructure(latestStructure, currentViewVectorIndex);
+		fitCameraToStructure(getCurrentFrameStructure(), currentViewVectorIndex);
 	}
 
 	for (const button of cameraButtonContainer.querySelectorAll('button')) {
@@ -351,17 +426,223 @@ function toggleCameraProjection() {
 		}
 	}
 }
+function hasTrajectoryFrames() {
+	return latestStructure &&
+		Array.isArray(latestStructure.frames) &&
+		latestStructure.frames.length > 1;
+}
+
+function getCurrentFrameStructure() {
+	if (!latestStructure) {
+		return undefined;
+	}
+
+	if (!Array.isArray(latestStructure.frames) || latestStructure.frames.length === 0) {
+		return latestStructure;
+	}
+
+	const frame = latestStructure.frames[currentFrameIndex] ?? latestStructure.frames[0];
+
+	return {
+		...latestStructure,
+		atoms: frame.atoms,
+		coordinateMode: frame.coordinateMode
+	};
+}
+
+function renderCurrentFrame(options = {}) {
+	const frameStructure = getCurrentFrameStructure();
+
+	if (!frameStructure) {
+		return;
+	}
+
+	if (
+		options.preserveCamera === true &&
+		tryUpdateAtomPositionsOnly(frameStructure)
+	) {
+		updateFrameLabel();
+		clearHoverInfo();
+		return;
+	}
+
+	renderStructure(frameStructure, options);
+}
+
+function tryUpdateAtomPositionsOnly(structure) {
+	if (!currentStructureGroup || atomMeshes.length !== structure.atoms.length) {
+		return false;
+	}
+
+	for (let index = 0; index < structure.atoms.length; index++) {
+		const atom = structure.atoms[index];
+		const mesh = atomMeshes[index];
+
+		if (!mesh || mesh.userData.atom?.element !== atom.element) {
+			return false;
+		}
+	}
+
+	for (let index = 0; index < structure.atoms.length; index++) {
+		const atom = structure.atoms[index];
+		const mesh = atomMeshes[index];
+
+		mesh.position.set(atom.position[0], atom.position[1], atom.position[2]);
+		mesh.userData.atom = atom;
+		mesh.userData.atomIndex = index;
+		mesh.userData.frameIndex = currentFrameIndex;
+	}
+
+	updateBondsForCurrentFrame(structure);
+	return true;
+}
+
+function updateBondsForCurrentFrame(structure) {
+	if (!currentStructureGroup) {
+		return;
+	}
+
+	if (currentBondGroup) {
+		currentStructureGroup.remove(currentBondGroup);
+		disposeObject3D(currentBondGroup);
+	}
+
+	currentBondGroup = new THREE.Group();
+	drawBonds(structure, currentBondGroup);
+	currentStructureGroup.add(currentBondGroup);
+}
+
+function updateFrameSlider() {
+	if (!frameSliderContainer || !frameSlider || !frameLabel) {
+		return;
+	}
+
+	if (!hasTrajectoryFrames()) {
+		frameSliderContainer.style.display = 'none';
+		stopTrajectoryPlayback();
+		frameSlider.min = '0';
+		frameSlider.max = '0';
+		frameSlider.value = '0';
+		updateFrameLabel();
+		return;
+	}
+
+	const frameCount = latestStructure.frames.length;
+	currentFrameIndex = Math.min(Math.max(currentFrameIndex, 0), frameCount - 1);
+	frameSlider.min = '0';
+	frameSlider.max = String(frameCount - 1);
+	frameSlider.value = String(currentFrameIndex);
+	frameSliderContainer.style.display = 'flex';
+	updateFrameLabel();
+}
+
+function updateFrameLabel() {
+	if (!frameLabel) {
+		return;
+	}
+
+	const frameCount = Array.isArray(latestStructure?.frames)
+		? latestStructure.frames.length
+		: 1;
+
+	const frame = latestStructure?.frames?.[currentFrameIndex];
+	const displayIndex = frame?.index ?? currentFrameIndex + 1;
+	frameLabel.textContent = `Frame ${displayIndex} / ${frameCount}`;
+}
+
+function toggleTrajectoryPlayback() {
+	if (isPlayingTrajectory) {
+		stopTrajectoryPlayback();
+		return;
+	}
+
+	startTrajectoryPlayback();
+}
+
+function startTrajectoryPlayback() {
+	if (!hasTrajectoryFrames()) {
+		return;
+	}
+
+	isPlayingTrajectory = true;
+	updatePlayPauseButton();
+
+	if (playbackTimer) {
+		clearInterval(playbackTimer);
+	}
+
+	playbackTimer = setInterval(() => {
+		advanceTrajectoryFrame();
+	}, getPlaybackIntervalMs());
+}
+
+function getPlaybackIntervalMs() {
+	const frameCount = Array.isArray(latestStructure?.frames)
+		? latestStructure.frames.length
+		: 1;
+
+	if (frameCount <= 1) {
+		return SLOWEST_PLAYBACK_INTERVAL_MS;
+	}
+
+	const loopBasedInterval =
+		(TARGET_TRAJECTORY_LOOP_SECONDS * 1000) / frameCount;
+
+	return Math.max(
+		FASTEST_PLAYBACK_INTERVAL_MS,
+		Math.min(SLOWEST_PLAYBACK_INTERVAL_MS, loopBasedInterval)
+	);
+}
+
+function stopTrajectoryPlayback() {
+	isPlayingTrajectory = false;
+	updatePlayPauseButton();
+
+	if (playbackTimer) {
+		clearInterval(playbackTimer);
+		playbackTimer = undefined;
+	}
+}
+
+function advanceTrajectoryFrame() {
+	if (!hasTrajectoryFrames()) {
+		stopTrajectoryPlayback();
+		return;
+	}
+
+	const frameCount = latestStructure.frames.length;
+	currentFrameIndex = (currentFrameIndex + 1) % frameCount;
+	frameSlider.value = String(currentFrameIndex);
+	updateFrameLabel();
+	renderCurrentFrame({ preserveCamera: true });
+}
+
+function updatePlayPauseButton() {
+	if (!playPauseButton) {
+		return;
+	}
+
+	playPauseButton.textContent = isPlayingTrajectory ? '⏸' : '▶';
+	playPauseButton.title = isPlayingTrajectory ? 'Pause trajectory' : 'Play trajectory';
+}
 
 function renderStructure(structure, options = {}) {
 	const preserveCamera = options.preserveCamera === true;
 	const previousCameraState = preserveCamera ? captureCameraState() : undefined;
+	updateFrameLabel();
+
 	if (currentStructureGroup) {
 		scene.remove(currentStructureGroup);
+		disposeObject3D(currentStructureGroup);
+		atomMeshes = [];
+		currentBondGroup = undefined;
 	}
 
 	currentStructureGroup = new THREE.Group();
+	currentBondGroup = new THREE.Group();
 
-	drawBonds(structure, currentStructureGroup);
+	drawBonds(structure, currentBondGroup);
+	currentStructureGroup.add(currentBondGroup);
 	drawAtoms(structure, currentStructureGroup);
 	drawUnitCell(structure.lattice, currentStructureGroup);
 
@@ -373,6 +654,34 @@ function renderStructure(structure, options = {}) {
 	} else {
 		fitCameraToStructure(structure, currentViewVectorIndex);
 	}
+}
+
+function disposeObject3D(object) {
+	object.traverse((child) => {
+		if (child.geometry) {
+			child.geometry.dispose();
+		}
+
+		if (child.material) {
+			if (Array.isArray(child.material)) {
+				for (const material of child.material) {
+					disposeMaterial(material);
+				}
+			} else {
+				disposeMaterial(child.material);
+			}
+		}
+	});
+}
+
+function disposeMaterial(material) {
+	for (const value of Object.values(material)) {
+		if (value && typeof value === 'object' && typeof value.dispose === 'function') {
+			value.dispose();
+		}
+	}
+
+	material.dispose();
 }
 
 function captureCameraState() {
@@ -447,6 +756,7 @@ function drawAtoms(structure, group) {
 		sphere.position.set(atom.position[0], atom.position[1], atom.position[2]);
 		sphere.userData.atom = atom;
 		sphere.userData.atomIndex = index;
+		sphere.userData.frameIndex = currentFrameIndex;
 		sphere.userData.originalColor = atomColor.clone();
 		sphere.userData.isConstrained = isConstrained;
 		atomMeshes.push(sphere);
@@ -475,13 +785,14 @@ function handlePointerMove(event) {
 	}
 
 	const mesh = intersections[0].object;
-	const atom = mesh.userData.atom;
 	const atomIndex = mesh.userData.atomIndex;
+	const frameStructure = getCurrentFrameStructure();
+	const atom = frameStructure?.atoms?.[atomIndex] ?? mesh.userData.atom;
 
 	mesh.scale.setScalar(1.18);
 	mesh.material.emissive = new THREE.Color(0x333333);
 
-	showAtomHoverInfo(atom, atomIndex);
+	showAtomHoverInfo(atom, atomIndex, currentFrameIndex, frameStructure?.coordinateMode);
 }
 
 function resetAtomHoverAppearance() {
@@ -501,14 +812,21 @@ function clearHoverInfo() {
 	}
 }
 
-function showAtomHoverInfo(atom, atomIndex) {
+function showAtomHoverInfo(atom, atomIndex, frameIndex, coordinateMode) {
 	const lines = [
-		`Atom ${atomIndex + 1}: ${atom.element}`,
-		`Cartesian: ${formatVector(atom.position)}`
+		`Atom ${atomIndex + 1}: ${atom.element}`
 	];
 
-	if (atom.fractionalPosition) {
-		lines.push(`Fractional: ${formatVector(atom.fractionalPosition)}`);
+	if (hasTrajectoryFrames()) {
+		const frame = latestStructure?.frames?.[frameIndex];
+		const displayIndex = frame?.index ?? frameIndex + 1;
+		lines.splice(1, 0, `Frame: ${displayIndex}`);
+	}
+
+	if (coordinateMode === 'Direct' && atom.fractionalPosition) {
+		lines.push(`Direct: ${formatVector(atom.fractionalPosition)}`);
+	} else {
+		lines.push(`Cartesian: ${formatVector(atom.position)}`);
 	}
 
 	if (Array.isArray(atom.selectiveDynamics)) {

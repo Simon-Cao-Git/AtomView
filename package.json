@@ -1,7 +1,7 @@
 {
 	"name": "atomview",
 	"description": "Lightweight live atomic structure preview for VASP POSCAR files inside VS Code",
-	"version": "0.1.2",
+	"version": "0.2.1",
 	"publisher": "PurunSimonCao",
 	"private": false,
 	"repository": {
@@ -34,7 +34,7 @@
 				{
 					"command": "atomview.openPreview",
 					"group": "navigation",
-					"when": "resourceFilename == POSCAR || resourceFilename == CONTCAR || resourceExtname == .vasp"
+					"when": "resourceFilename == POSCAR || resourceFilename == CONTCAR || resourceFilename == XDATCAR || resourceExtname =~ /\\.[vV][aA][sS][pP]/"
 				}
 			]
 		}
