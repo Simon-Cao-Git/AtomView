@@ -13,6 +13,13 @@ let raycaster;
 let pointer;
 let atomMeshes = [];
 let bondRules = new Map();
+let cameraButtonContainer;
+let axisRenderer;
+let axisScene;
+let axisCamera;
+let latticeAxisGroup;
+let isPerspectiveMode = false;
+let currentViewVectorIndex = 2;
 
 const BALL_RADIUS_SCALE = 0.4;
 const BOND_RADIUS = 0.06;
@@ -31,9 +38,10 @@ window.addEventListener('message', (event) => {
 	}
 
 	if (message.command === 'showStructure') {
+		const hadStructure = Boolean(latestStructure);
 		latestStructure = message.structure;
 		showStatus('');
-		renderStructure(latestStructure);
+		renderStructure(latestStructure, { preserveCamera: hadStructure });
 	}
 });
 
@@ -103,7 +111,7 @@ function initViewer() {
 
 	hoverElement = document.createElement('pre');
 	hoverElement.style.position = 'absolute';
-	hoverElement.style.left = '16px';
+	hoverElement.style.right = '16px';
 	hoverElement.style.bottom = '16px';
 	hoverElement.style.margin = '0';
 	hoverElement.style.padding = '8px 10px';
@@ -118,15 +126,30 @@ function initViewer() {
 	hoverElement.style.display = 'none';
 	document.body.appendChild(hoverElement);
 
+	cameraButtonContainer = document.createElement('div');
+	cameraButtonContainer.style.position = 'absolute';
+	cameraButtonContainer.style.right = '16px';
+	cameraButtonContainer.style.top = '16px';
+	cameraButtonContainer.style.display = 'flex';
+	cameraButtonContainer.style.gap = '6px';
+	cameraButtonContainer.style.zIndex = '10';
+	document.body.appendChild(cameraButtonContainer);
+
+	addCameraButton('a', () => setCameraAlongLatticeVector(0));
+	addCameraButton('b', () => setCameraAlongLatticeVector(1));
+	addCameraButton('c', () => setCameraAlongLatticeVector(2));
+	addCameraButton('ortho', toggleCameraProjection);
+
 	scene = new THREE.Scene();
 	scene.background = new THREE.Color(0x000000);
 
-	camera = new THREE.OrthographicCamera(-5, 5, 5, -5, -10000, 10000);
+	camera = createCamera();
 
 	renderer = new THREE.WebGLRenderer({ antialias: true });
 	renderer.setPixelRatio(window.devicePixelRatio);
 	renderer.setSize(window.innerWidth, window.innerHeight);
 	container.appendChild(renderer.domElement);
+	initAxisViewer();
 
 	controls = new OrbitControls(camera, renderer.domElement);
 	controls.enableDamping = false;
@@ -146,7 +169,7 @@ function initViewer() {
 	window.addEventListener('resize', () => {
 		renderer.setSize(window.innerWidth, window.innerHeight);
 		if (latestStructure) {
-			fitCameraToStructure(latestStructure);
+			fitCameraToStructure(latestStructure, currentViewVectorIndex);
 		}
 	});
 
@@ -157,6 +180,7 @@ function animate() {
 	requestAnimationFrame(animate);
 	controls.update();
 	renderer.render(scene, camera);
+	renderAxisViewer();
 }
 
 function showStatus(text) {
@@ -164,7 +188,173 @@ function showStatus(text) {
 	statusElement.style.display = text ? 'block' : 'none';
 }
 
-function renderStructure(structure) {
+function createCamera() {
+	if (isPerspectiveMode) {
+		return new THREE.PerspectiveCamera(
+			35,
+			window.innerWidth / window.innerHeight,
+			0.01,
+			100000
+		);
+	}
+
+	return new THREE.OrthographicCamera(-5, 5, 5, -5, -10000, 10000);
+}
+
+function initAxisViewer() {
+	const size = 100;
+
+	axisRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+	axisRenderer.setPixelRatio(window.devicePixelRatio);
+	axisRenderer.setSize(size, size);
+	axisRenderer.domElement.style.position = 'absolute';
+	axisRenderer.domElement.style.left = '16px';
+	axisRenderer.domElement.style.bottom = '16px';
+	axisRenderer.domElement.style.width = `${size}px`;
+	axisRenderer.domElement.style.height = `${size}px`;
+	axisRenderer.domElement.style.pointerEvents = 'none';
+	axisRenderer.domElement.style.zIndex = '8';
+	document.body.appendChild(axisRenderer.domElement);
+
+	axisScene = new THREE.Scene();
+	axisCamera = new THREE.PerspectiveCamera(35, 1, 0.01, 100);
+	axisCamera.position.set(0, 0, 6);
+	axisCamera.lookAt(0, 0, 0);
+
+	const light = new THREE.AmbientLight(0xffffff, 1.0);
+	axisScene.add(light);
+}
+
+function renderAxisViewer() {
+	if (!axisRenderer || !axisScene || !axisCamera || !camera) {
+		return;
+	}
+
+	const direction = camera.position.clone();
+	if (direction.lengthSq() < 1e-12) {
+		direction.set(0, 0, 1);
+	}
+	direction.normalize();
+
+	axisCamera.position.copy(direction.multiplyScalar(6));
+	axisCamera.up.copy(camera.up).normalize();
+	axisCamera.lookAt(0, 0, 0);
+	axisRenderer.render(axisScene, axisCamera);
+}
+
+function updateLatticeAxisViewer(lattice) {
+	if (!axisScene) {
+		return;
+	}
+
+	if (latticeAxisGroup) {
+		axisScene.remove(latticeAxisGroup);
+	}
+
+	latticeAxisGroup = new THREE.Group();
+
+	const a = new THREE.Vector3(...lattice[0]);
+	const b = new THREE.Vector3(...lattice[1]);
+	const c = new THREE.Vector3(...lattice[2]);
+	const vectors = [a, b, c];
+	const labels = ['a', 'b', 'c'];
+	const colors = [0xff5555, 0x55ff55, 0x5599ff];
+
+	for (let i = 0; i < 3; i++) {
+		let direction = vectors[i].clone();
+		if (direction.lengthSq() < 1e-12) {
+			continue;
+		}
+		direction.normalize();
+
+		const arrow = new THREE.ArrowHelper(direction, new THREE.Vector3(0, 0, 0), 1.4, colors[i], 0.25, 0.14);
+		latticeAxisGroup.add(arrow);
+
+		const label = createAxisLabel(labels[i], colors[i]);
+		label.position.copy(direction.multiplyScalar(1.75));
+		latticeAxisGroup.add(label);
+	}
+
+	axisScene.add(latticeAxisGroup);
+}
+
+function createAxisLabel(text, color) {
+	const canvas = document.createElement('canvas');
+	canvas.width = 64;
+	canvas.height = 64;
+	const context = canvas.getContext('2d');
+	context.clearRect(0, 0, canvas.width, canvas.height);
+	context.font = 'bold 42px sans-serif';
+	context.textAlign = 'center';
+	context.textBaseline = 'middle';
+	context.fillStyle = `#${color.toString(16).padStart(6, '0')}`;
+	context.fillText(text, canvas.width / 2, canvas.height / 2);
+
+	const texture = new THREE.CanvasTexture(canvas);
+	const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+	const sprite = new THREE.Sprite(material);
+	sprite.scale.set(0.4, 0.4, 0.4);
+	return sprite;
+}
+
+function addCameraButton(label, onClick) {
+	const button = document.createElement('button');
+	button.textContent = label;
+	button.dataset.label = label;
+	button.title = `View along lattice vector ${label}`;
+	button.style.minWidth = '28px';
+	button.style.height = '28px';
+	button.style.border = '1px solid rgba(255, 255, 255, 0.35)';
+	button.style.borderRadius = '4px';
+	button.style.color = 'var(--vscode-foreground)';
+	button.style.background = 'rgba(0, 0, 0, 0.65)';
+	button.style.cursor = 'pointer';
+	button.style.fontFamily = 'var(--vscode-font-family)';
+	button.style.fontSize = '13px';
+	button.addEventListener('click', onClick);
+	cameraButtonContainer.appendChild(button);
+}
+
+function setCameraAlongLatticeVector(latticeVectorIndex) {
+	if (!latestStructure) {
+		return;
+	}
+	currentViewVectorIndex = latticeVectorIndex;
+	fitCameraToStructure(latestStructure, latticeVectorIndex);
+}
+
+function toggleCameraProjection() {
+	isPerspectiveMode = !isPerspectiveMode;
+
+	const oldPosition = camera.position.clone();
+	const oldUp = camera.up.clone();
+
+	camera = createCamera();
+	camera.position.copy(oldPosition);
+	camera.up.copy(oldUp);
+	camera.lookAt(0, 0, 0);
+
+	controls.dispose();
+	controls = new OrbitControls(camera, renderer.domElement);
+	controls.enableDamping = false;
+	controls.screenSpacePanning = true;
+	controls.target.set(0, 0, 0);
+
+	if (latestStructure) {
+		fitCameraToStructure(latestStructure, currentViewVectorIndex);
+	}
+
+	for (const button of cameraButtonContainer.querySelectorAll('button')) {
+		if (button.dataset.label === 'ortho') {
+			button.textContent = isPerspectiveMode ? 'persp' : 'ortho';
+			button.title = isPerspectiveMode ? 'Switch to orthographic projection' : 'Switch to perspective projection';
+		}
+	}
+}
+
+function renderStructure(structure, options = {}) {
+	const preserveCamera = options.preserveCamera === true;
+	const previousCameraState = preserveCamera ? captureCameraState() : undefined;
 	if (currentStructureGroup) {
 		scene.remove(currentStructureGroup);
 	}
@@ -176,7 +366,60 @@ function renderStructure(structure) {
 	drawUnitCell(structure.lattice, currentStructureGroup);
 
 	scene.add(currentStructureGroup);
-	fitCameraToStructure(structure);
+	updateLatticeAxisViewer(structure.lattice);
+	if (previousCameraState) {
+		fitCameraToStructure(structure, currentViewVectorIndex);
+		restoreCameraState(previousCameraState);
+	} else {
+		fitCameraToStructure(structure, currentViewVectorIndex);
+	}
+}
+
+function captureCameraState() {
+	const state = {
+		position: camera.position.clone(),
+		up: camera.up.clone(),
+		target: controls.target.clone(),
+		isPerspective: camera.isPerspectiveCamera
+	};
+
+	if (camera.isOrthographicCamera) {
+		state.left = camera.left;
+		state.right = camera.right;
+		state.top = camera.top;
+		state.bottom = camera.bottom;
+		state.zoom = camera.zoom;
+	}
+
+	if (camera.isPerspectiveCamera) {
+		state.fov = camera.fov;
+		state.zoom = camera.zoom;
+	}
+
+	return state;
+}
+
+function restoreCameraState(state) {
+	camera.position.copy(state.position);
+	camera.up.copy(state.up);
+	controls.target.copy(state.target);
+
+	if (camera.isOrthographicCamera && !state.isPerspective) {
+		camera.left = state.left;
+		camera.right = state.right;
+		camera.top = state.top;
+		camera.bottom = state.bottom;
+		camera.zoom = state.zoom;
+	}
+
+	if (camera.isPerspectiveCamera && state.isPerspective) {
+		camera.fov = state.fov;
+		camera.zoom = state.zoom;
+	}
+
+	camera.lookAt(controls.target);
+	camera.updateProjectionMatrix();
+	controls.update();
 }
 
 function drawAtoms(structure, group) {
@@ -408,10 +651,11 @@ function drawUnitCell(lattice, group) {
 	group.add(new THREE.LineSegments(geometry, material));
 }
 
-function fitCameraToStructure(structure) {
+function fitCameraToStructure(structure, viewVectorIndex = 2) {
 	if (!currentStructureGroup) {
 		return;
 	}
+	currentViewVectorIndex = viewVectorIndex;
 
 	currentStructureGroup.position.set(0, 0, 0);
 
@@ -423,31 +667,51 @@ function fitCameraToStructure(structure) {
 
 	const a = new THREE.Vector3(...structure.lattice[0]);
 	const b = new THREE.Vector3(...structure.lattice[1]);
+	const c = new THREE.Vector3(...structure.lattice[2]);
+	const latticeVectors = [a, b, c];
 
-	let normal = new THREE.Vector3().crossVectors(a, b);
-	if (normal.lengthSq() < 1e-12) {
-		normal = new THREE.Vector3(0, 0, 1);
+	let viewDirection = latticeVectors[viewVectorIndex]?.clone() ?? c.clone();
+	if (viewDirection.lengthSq() < 1e-12) {
+		viewDirection = new THREE.Vector3(0, 0, 1);
 	} else {
-		normal.normalize();
+		viewDirection.normalize();
+	}
+
+	let upDirection;
+	if (viewVectorIndex === 0) {
+		upDirection = c.clone();
+	} else {
+		upDirection = b.clone();
+	}
+
+	if (upDirection.lengthSq() < 1e-12 || Math.abs(upDirection.clone().normalize().dot(viewDirection)) > 0.98) {
+		upDirection = new THREE.Vector3(0, 1, 0);
 	}
 
 	const maxDim = Math.max(size.x, size.y, size.z, 1);
 	const distance = maxDim * 4;
 
-	camera.position.copy(normal.multiplyScalar(distance));
-	camera.up.copy(b.clone().normalize());
+	camera.position.copy(viewDirection.multiplyScalar(distance));
+	camera.up.copy(upDirection.normalize());
 	camera.lookAt(0, 0, 0);
 
-	const aspect = window.innerWidth / window.innerHeight;
-	const viewSize = maxDim * 1.25;
+	if (camera.isOrthographicCamera) {
+		const aspect = window.innerWidth / window.innerHeight;
+		const viewSize = maxDim * 1.25;
 
-	camera.left = (-viewSize * aspect) / 2;
-	camera.right = (viewSize * aspect) / 2;
-	camera.top = viewSize / 2;
-	camera.bottom = -viewSize / 2;
-	camera.near = -distance * 10;
-	camera.far = distance * 10;
-	camera.updateProjectionMatrix();
+		camera.left = (-viewSize * aspect) / 2;
+		camera.right = (viewSize * aspect) / 2;
+		camera.top = viewSize / 2;
+		camera.bottom = -viewSize / 2;
+		camera.near = -distance * 10;
+		camera.far = distance * 10;
+		camera.updateProjectionMatrix();
+	} else {
+		camera.aspect = window.innerWidth / window.innerHeight;
+		camera.near = distance / 100;
+		camera.far = distance * 100;
+		camera.updateProjectionMatrix();
+	}
 
 	controls.target.set(0, 0, 0);
 	controls.update();
