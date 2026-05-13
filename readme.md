@@ -1,6 +1,6 @@
 # AtomView
 
-[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20149819-blue.png)](https://doi.org/10.5281/zenodo.20149819)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20149818-blue.png)](https://doi.org/10.5281/zenodo.20149818)
 
 Lightweight live atomic structure preview for VASP POSCAR files inside VS Code.
 
