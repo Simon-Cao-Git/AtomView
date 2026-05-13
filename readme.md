@@ -1,5 +1,7 @@
 # AtomView
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20149819.svg)](https://doi.org/10.5281/zenodo.20149819)
+
 Lightweight live atomic structure preview for VASP POSCAR files inside VS Code.
 
 AtomView provides fast in-editor structure visualization for computational materials and atomistic simulation workflows, with automatic live updates as structures are modified.
