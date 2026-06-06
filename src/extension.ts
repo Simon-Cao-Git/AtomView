@@ -2,7 +2,16 @@ import * as vscode from 'vscode';
 
 type Vec3 = [number, number, number];
 
-type SourceFormat = 'POSCAR' | 'CONTCAR' | 'VASP' | 'XDATCAR';
+type SourceFormat =
+	| 'POSCAR'
+	| 'CONTCAR'
+	| 'VASP'
+	| 'XDATCAR'
+	| 'FDF'
+	| 'GJF'
+	| 'QE';
+
+type ParserFamily = 'vasp' | 'siesta' | 'gaussian' | 'qe';
 
 interface Atom {
 	element: string;
@@ -19,7 +28,7 @@ interface TrajectoryFrame {
 
 interface AtomicStructure {
 	title: string;
-	lattice: [Vec3, Vec3, Vec3];
+	lattice?: [Vec3, Vec3, Vec3];
 	atoms: Atom[];
 	coordinateMode: 'Direct' | 'Cartesian';
 	sourceFormat: SourceFormat;
@@ -30,6 +39,29 @@ interface ParsedPoscarBlock {
 	structure: AtomicStructure;
 	nextLineIndex: number;
 }
+
+interface DetectedFormat {
+	sourceFormat: SourceFormat;
+	parserFamily: ParserFamily;
+}
+
+interface FdfLine {
+	raw: string;
+	clean: string;
+	lower: string;
+}
+
+type FdfCoordinateFormat =
+	| 'Fractional'
+	| 'CartesianAngstrom'
+	| 'CartesianBohr'
+	| 'ScaledCartesian';
+
+type QeCoordinateFormat =
+	| 'Crystal'
+	| 'CartesianAngstrom'
+	| 'CartesianBohr'
+	| 'Alat';
 
 export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(
@@ -128,7 +160,7 @@ class AtomViewPanel {
 
 		if (!document) {
 			this.postStatus(
-				'Open a POSCAR, CONTCAR, XDATCAR, or .vasp file to preview it.'
+				'Open a POSCAR, CONTCAR, XDATCAR, .vasp, .fdf, .gjf, or .in file to preview it.'
 			);
 			return;
 		}
@@ -138,36 +170,18 @@ class AtomViewPanel {
 
 	private updateFromDocument(document: vscode.TextDocument) {
 		const fileName = document.fileName.split(/[\\/]/).pop() ?? '';
-		const normalizedFileName = fileName.toUpperCase();
+		const text = document.getText();
+		const detectedFormat = detectFormat(fileName, text);
 
-		const isSupportedFile =
-			normalizedFileName === 'POSCAR' ||
-			normalizedFileName === 'CONTCAR' ||
-			normalizedFileName === 'XDATCAR' ||
-			normalizedFileName.endsWith('.VASP');
-
-		if (!isSupportedFile) {
+		if (!detectedFormat) {
 			this.postStatus(
-				`Source file is ${fileName}. Open POSCAR, CONTCAR, XDATCAR, or a .vasp file to preview a structure.`
+				`Source file is ${fileName}. Open a supported atomistic structure/input file to preview it.`
 			);
 			return;
 		}
 
 		try {
-			const sourceFormat: SourceFormat =
-				normalizedFileName === 'POSCAR'
-					? 'POSCAR'
-					: normalizedFileName === 'CONTCAR'
-						? 'CONTCAR'
-						: normalizedFileName === 'XDATCAR'
-							? 'XDATCAR'
-							: 'VASP';
-
-			const structure = parseStructureFile(
-				document.getText(),
-				sourceFormat
-			);
-
+			const structure = parseStructureFile(text, detectedFormat);
 			this.panel.title = `AtomView: ${fileName}`;
 
 			this.panel.webview.postMessage({
@@ -180,9 +194,7 @@ class AtomViewPanel {
 					? error.message
 					: String(error);
 
-			this.postStatus(
-				`Failed to parse ${fileName}: ${message}`
-			);
+			this.postStatus(`Failed to parse ${fileName}: ${message}`);
 		}
 	}
 
@@ -203,11 +215,7 @@ class AtomViewPanel {
 
 	private getHtmlForWebview(webview: vscode.Webview) {
 		const scriptUri = webview.asWebviewUri(
-			vscode.Uri.joinPath(
-				this.extensionUri,
-				'media',
-				'main.js'
-			)
+			vscode.Uri.joinPath(this.extensionUri, 'media', 'main.js')
 		);
 
 		const threeUri = webview.asWebviewUri(
@@ -290,7 +298,72 @@ class AtomViewPanel {
 	}
 }
 
+function detectFormat(fileName: string, text: string): DetectedFormat | undefined {
+	const lowerFileName = fileName.toLowerCase();
+	const baseName = lowerFileName.split(/[\\/]/).pop() ?? lowerFileName;
+	const firstChunk = text.slice(0, 12000).toLowerCase();
+
+	if (baseName.includes('xdatcar')) {
+		return { sourceFormat: 'XDATCAR', parserFamily: 'vasp' };
+	}
+
+	if (baseName.includes('poscar')) {
+		return { sourceFormat: 'POSCAR', parserFamily: 'vasp' };
+	}
+
+	if (baseName.includes('contcar')) {
+		return { sourceFormat: 'CONTCAR', parserFamily: 'vasp' };
+	}
+
+	if (lowerFileName.endsWith('.vasp')) {
+		return { sourceFormat: 'VASP', parserFamily: 'vasp' };
+	}
+
+	if (lowerFileName.endsWith('.fdf')) {
+		return { sourceFormat: 'FDF', parserFamily: 'siesta' };
+	}
+
+	if (lowerFileName.endsWith('.gjf')) {
+		return { sourceFormat: 'GJF', parserFamily: 'gaussian' };
+	}
+
+	if (lowerFileName.endsWith('.in')) {
+		if (
+			firstChunk.includes('atomic_positions') ||
+			firstChunk.includes('&control') ||
+			firstChunk.includes('&system')
+		) {
+			return { sourceFormat: 'QE', parserFamily: 'qe' };
+		}
+	}
+
+	return undefined;
+}
+
 function parseStructureFile(
+	text: string,
+	detectedFormat: DetectedFormat
+): AtomicStructure {
+	switch (detectedFormat.parserFamily) {
+		case 'vasp':
+			return parseVaspStructureFile(text, detectedFormat.sourceFormat);
+
+		case 'siesta':
+			return parseSiestaFdf(text);
+
+		case 'gaussian':
+			return parseGaussianGjf(text);
+
+		case 'qe':
+			return parseQuantumEspressoInput(text);
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/* VASP / POSCAR / CONTCAR / XDATCAR                                          */
+/* -------------------------------------------------------------------------- */
+
+function parseVaspStructureFile(
 	text: string,
 	sourceFormat: SourceFormat
 ): AtomicStructure {
@@ -614,6 +687,1040 @@ function parseSinglePoscarBlock(
 		sourceFormat
 	};
 }
+
+/* -------------------------------------------------------------------------- */
+/* SIESTA FDF                                                                 */
+/* -------------------------------------------------------------------------- */
+
+function parseSiestaFdf(text: string): AtomicStructure {
+	const lines = preprocessFdfLines(text);
+
+	if (hasFdfBlock(lines, 'ZMATRIX')) {
+		throw new Error('SIESTA Z-matrix input is not supported yet. AtomView currently supports only explicit x y z coordinates via %block AtomicCoordinatesAndAtomicSpecies.');
+	}
+
+	const title =
+		getFdfStringValue(lines, 'SystemName') ??
+		getFdfStringValue(lines, 'SystemLabel') ??
+		'SIESTA FDF';
+
+	const latticeConstant = parseFdfLatticeConstant(lines);
+	const lattice = parseFdfLattice(lines, latticeConstant);
+	const speciesMap = parseFdfSpeciesMap(lines);
+	const coordinateFormat = parseFdfCoordinateFormat(lines);
+	const atoms = parseFdfAtoms(
+		lines,
+		speciesMap,
+		lattice,
+		latticeConstant,
+		coordinateFormat
+	);
+
+	if (atoms.length === 0) {
+		throw new Error('No atoms found in %block AtomicCoordinatesAndAtomicSpecies.');
+	}
+
+	return {
+		title,
+		lattice,
+		atoms,
+		coordinateMode: coordinateFormat === 'Fractional' ? 'Direct' : 'Cartesian',
+		sourceFormat: 'FDF'
+	};
+}
+
+function preprocessFdfLines(text: string): FdfLine[] {
+	return text
+		.split(/\r?\n/)
+		.map((raw) => {
+			const clean = stripFdfComment(raw).trim();
+
+			return {
+				raw,
+				clean,
+				lower: clean.toLowerCase()
+			};
+		})
+		.filter((line) => line.clean.length > 0);
+}
+
+function stripFdfComment(line: string): string {
+	const commentIndex = line.indexOf('#');
+	return commentIndex >= 0 ? line.slice(0, commentIndex) : line;
+}
+
+function getFdfStringValue(lines: FdfLine[], key: string): string | undefined {
+	const lowerKey = key.toLowerCase();
+	const line = lines.find((entry) => {
+		const tokens = entry.lower.split(/\s+/);
+		return tokens[0] === lowerKey;
+	});
+
+	if (!line) {
+		return undefined;
+	}
+
+	return line.clean.split(/\s+/).slice(1).join(' ') || undefined;
+}
+
+function getFdfBlock(lines: FdfLine[], blockName: string): string[] | undefined {
+	const lowerBlockName = blockName.toLowerCase();
+
+	const startIndex = lines.findIndex((line) =>
+		line.lower === `%block ${lowerBlockName}`
+	);
+
+	if (startIndex < 0) {
+		return undefined;
+	}
+
+	const blockLines: string[] = [];
+
+	for (let index = startIndex + 1; index < lines.length; index++) {
+		if (lines[index].lower === `%endblock ${lowerBlockName}`) {
+			return blockLines;
+		}
+
+		blockLines.push(lines[index].clean);
+	}
+
+	throw new Error(`Missing %endblock ${blockName}.`);
+}
+
+function hasFdfBlock(lines: FdfLine[], blockName: string): boolean {
+	const lowerBlockName = blockName.toLowerCase();
+	return lines.some((line) => line.lower === `%block ${lowerBlockName}`);
+}
+
+function parseFdfLatticeConstant(lines: FdfLine[]): number {
+	const line = findFdfLine(lines, 'LatticeConstant');
+
+	if (!line) {
+		return 1.0;
+	}
+
+	const tokens = line.clean.split(/\s+/);
+	const value = Number(tokens[1]);
+	const unit = tokens[2] ?? 'Ang';
+
+	if (!Number.isFinite(value)) {
+		throw new Error(`Invalid LatticeConstant line: ${line.raw}`);
+	}
+
+	return value * lengthUnitToAngstrom(unit);
+}
+
+function parseFdfLattice(
+	lines: FdfLine[],
+	latticeConstant: number
+): [Vec3, Vec3, Vec3] {
+	const latticeVectorBlock = getFdfBlock(lines, 'LatticeVectors');
+
+	if (latticeVectorBlock) {
+		if (latticeVectorBlock.length < 3) {
+			throw new Error('%block LatticeVectors must contain three vectors.');
+		}
+
+		return [
+			scaleVector(parseVector(latticeVectorBlock[0]), latticeConstant),
+			scaleVector(parseVector(latticeVectorBlock[1]), latticeConstant),
+			scaleVector(parseVector(latticeVectorBlock[2]), latticeConstant)
+		];
+	}
+
+	const latticeParametersBlock = getFdfBlock(lines, 'LatticeParameters');
+
+	if (latticeParametersBlock) {
+		const values = latticeParametersBlock
+			.join(' ')
+			.split(/\s+/)
+			.slice(0, 6)
+			.map(Number);
+
+		if (values.length < 6 || values.some((value) => !Number.isFinite(value))) {
+			throw new Error('%block LatticeParameters must contain a b c alpha beta gamma.');
+		}
+
+		return latticeParametersToVectors(values, latticeConstant);
+	}
+
+	throw new Error(
+		'SIESTA FDF parser currently requires %block LatticeVectors or %block LatticeParameters.'
+	);
+}
+
+function latticeParametersToVectors(
+	values: number[],
+	latticeConstant: number
+): [Vec3, Vec3, Vec3] {
+	const [aRaw, bRaw, cRaw, alphaDeg, betaDeg, gammaDeg] = values;
+
+	const a = aRaw * latticeConstant;
+	const b = bRaw * latticeConstant;
+	const c = cRaw * latticeConstant;
+
+	const alpha = degreesToRadians(alphaDeg);
+	const beta = degreesToRadians(betaDeg);
+	const gamma = degreesToRadians(gammaDeg);
+
+	const vectorA: Vec3 = [a, 0, 0];
+	const vectorB: Vec3 = [b * Math.cos(gamma), b * Math.sin(gamma), 0];
+
+	const cx = c * Math.cos(beta);
+	const cy =
+		c *
+		(Math.cos(alpha) - Math.cos(beta) * Math.cos(gamma)) /
+		Math.sin(gamma);
+
+	const czSquared = Math.max(c * c - cx * cx - cy * cy, 0);
+	const cz = Math.sqrt(czSquared);
+
+	return [vectorA, vectorB, [cx, cy, cz]];
+}
+
+function degreesToRadians(degrees: number): number {
+	return degrees * Math.PI / 180;
+}
+
+function parseFdfSpeciesMap(lines: FdfLine[]): Map<number, string> {
+	const speciesBlock = getFdfBlock(lines, 'ChemicalSpeciesLabel');
+	const speciesMap = new Map<number, string>();
+
+	if (!speciesBlock) {
+		return speciesMap;
+	}
+
+	for (const line of speciesBlock) {
+		const tokens = line.split(/\s+/);
+		const speciesIndex = parseInt(tokens[0], 10);
+		const label = tokens[2];
+
+		if (Number.isInteger(speciesIndex) && label) {
+			speciesMap.set(speciesIndex, normalizeElementSymbol(label));
+		}
+	}
+
+	return speciesMap;
+}
+
+function parseFdfCoordinateFormat(lines: FdfLine[]): FdfCoordinateFormat {
+	const line = findFdfLine(lines, 'AtomicCoordinatesFormat');
+	const value = line?.clean.split(/\s+/)[1]?.toLowerCase() ?? 'bohr';
+
+	if (value.startsWith('frac') || value.startsWith('crystal')) {
+		return 'Fractional';
+	}
+
+	if (value.startsWith('scaled')) {
+		return 'ScaledCartesian';
+	}
+
+	if (value.startsWith('ang')) {
+		return 'CartesianAngstrom';
+	}
+
+	if (value.startsWith('bohr')) {
+		return 'CartesianBohr';
+	}
+
+	throw new Error(`Unsupported AtomicCoordinatesFormat: ${value}`);
+}
+
+function parseFdfAtoms(
+	lines: FdfLine[],
+	speciesMap: Map<number, string>,
+	lattice: [Vec3, Vec3, Vec3],
+	latticeConstant: number,
+	coordinateFormat: FdfCoordinateFormat
+): Atom[] {
+	const atomBlock = getFdfBlock(lines, 'AtomicCoordinatesAndAtomicSpecies');
+
+	if (!atomBlock) {
+		throw new Error('Missing %block AtomicCoordinatesAndAtomicSpecies. AtomView currently supports only explicit SIESTA x y z coordinate blocks, not Z-matrix-style structure definitions.');
+	}
+
+	return atomBlock.map((line) => {
+		const tokens = line.split(/\s+/);
+
+		if (tokens.length < 4) {
+			throw new Error(`Invalid AtomicCoordinatesAndAtomicSpecies line: ${line}`);
+		}
+
+		const rawPosition: Vec3 = [
+			Number(tokens[0]),
+			Number(tokens[1]),
+			Number(tokens[2])
+		];
+
+		if (rawPosition.some((value) => !Number.isFinite(value))) {
+			throw new Error(`Invalid atomic coordinate line: ${line}`);
+		}
+
+		const speciesIndex = parseInt(tokens[3], 10);
+		const element = speciesMap.get(speciesIndex) ?? `X${speciesIndex}`;
+		const selectiveDynamics = undefined;
+
+		if (coordinateFormat === 'Fractional') {
+			return {
+				element,
+				fractionalPosition: rawPosition,
+				selectiveDynamics,
+				position: fractionalToCartesian(rawPosition, lattice)
+			};
+		}
+
+		if (coordinateFormat === 'CartesianAngstrom') {
+			return {
+				element,
+				selectiveDynamics,
+				position: rawPosition
+			};
+		}
+
+		if (coordinateFormat === 'CartesianBohr') {
+			return {
+				element,
+				selectiveDynamics,
+				position: scaleVector(rawPosition, lengthUnitToAngstrom('Bohr'))
+			};
+		}
+
+		return {
+			element,
+			selectiveDynamics,
+			position: scaleVector(rawPosition, latticeConstant)
+		};
+	});
+}
+
+function findFdfLine(lines: FdfLine[], key: string): FdfLine | undefined {
+	const lowerKey = key.toLowerCase();
+
+	return lines.find((entry) => {
+		const tokens = entry.lower.split(/\s+/);
+		return tokens[0] === lowerKey;
+	});
+}
+
+function lengthUnitToAngstrom(unit: string): number {
+	const normalized = unit.toLowerCase();
+
+	if (normalized.startsWith('ang')) {
+		return 1.0;
+	}
+
+	if (normalized.startsWith('bohr')) {
+		return 0.529177210903;
+	}
+
+	if (normalized === 'nm') {
+		return 10.0;
+	}
+
+	throw new Error(`Unsupported length unit: ${unit}`);
+}
+
+function normalizeElementSymbol(label: string): string {
+	const cleaned = label.replace(/[^a-zA-Z]/g, '');
+
+	if (!cleaned) {
+		return label;
+	}
+
+	return cleaned[0].toUpperCase() + cleaned.slice(1).toLowerCase();
+}
+
+/* -------------------------------------------------------------------------- */
+/* Gaussian GJF / COM                                                         */
+/* -------------------------------------------------------------------------- */
+
+interface GaussianMoleculeSpecification {
+	atoms: Atom[];
+	translationVectors: Vec3[];
+}
+
+interface GaussianAtomSpec {
+	element: string;
+	parameters?: string;
+}
+
+function parseGaussianGjf(text: string): AtomicStructure {
+	const rawLines = text.split(/\r?\n/);
+	const moleculeStartIndex = findGaussianMoleculeSpecificationStart(rawLines);
+	const moleculeSpecification = parseGaussianMoleculeSpecification(rawLines, moleculeStartIndex);
+
+	if (moleculeSpecification.atoms.length === 0) {
+		throw new Error('No Cartesian atoms found in Gaussian molecule specification.');
+	}
+
+	const lattice = gaussianTranslationVectorsToLattice(moleculeSpecification.translationVectors);
+
+	return {
+		title: parseGaussianTitle(rawLines) ?? 'Gaussian input',
+		...(lattice ? { lattice } : {}),
+		atoms: moleculeSpecification.atoms,
+		coordinateMode: 'Cartesian',
+		sourceFormat: 'GJF'
+	};
+}
+
+function findGaussianMoleculeSpecificationStart(rawLines: string[]): number {
+	let index = 0;
+
+	while (index < rawLines.length && rawLines[index].trim().startsWith('%')) {
+		index += 1;
+	}
+
+	while (index < rawLines.length && rawLines[index].trim().length === 0) {
+		index += 1;
+	}
+
+	if (index >= rawLines.length || !rawLines[index].trim().startsWith('#')) {
+		throw new Error('Could not find Gaussian route section starting with #.');
+	}
+
+	while (index < rawLines.length && rawLines[index].trim().length > 0) {
+		index += 1;
+	}
+
+	while (index < rawLines.length && rawLines[index].trim().length === 0) {
+		index += 1;
+	}
+
+	while (index < rawLines.length && rawLines[index].trim().length > 0) {
+		index += 1;
+	}
+
+	while (index < rawLines.length && rawLines[index].trim().length === 0) {
+		index += 1;
+	}
+
+	if (index >= rawLines.length || !isGaussianChargeMultiplicityLine(rawLines[index])) {
+		throw new Error('Could not find Gaussian charge/multiplicity line.');
+	}
+
+	return index + 1;
+}
+
+function parseGaussianTitle(rawLines: string[]): string | undefined {
+	let index = 0;
+
+	while (index < rawLines.length && rawLines[index].trim().startsWith('%')) {
+		index += 1;
+	}
+
+	while (index < rawLines.length && rawLines[index].trim().length === 0) {
+		index += 1;
+	}
+
+	if (index >= rawLines.length || !rawLines[index].trim().startsWith('#')) {
+		return undefined;
+	}
+
+	while (index < rawLines.length && rawLines[index].trim().length > 0) {
+		index += 1;
+	}
+
+	while (index < rawLines.length && rawLines[index].trim().length === 0) {
+		index += 1;
+	}
+
+	const titleLines: string[] = [];
+
+	while (index < rawLines.length && rawLines[index].trim().length > 0) {
+		titleLines.push(rawLines[index].trim());
+		index += 1;
+	}
+
+	return titleLines.join(' ').trim() || undefined;
+}
+
+function isGaussianChargeMultiplicityLine(line: string): boolean {
+	const tokens = line.trim().split(/\s+/);
+
+	if (tokens.length < 2 || tokens.length % 2 !== 0) {
+		return false;
+	}
+
+	return tokens.every((token) => /^[-+]?\d+$/.test(token));
+}
+
+function parseGaussianMoleculeSpecification(
+	rawLines: string[],
+	startIndex: number
+): GaussianMoleculeSpecification {
+	const atoms: Atom[] = [];
+	const translationVectors: Vec3[] = [];
+
+	for (let index = startIndex; index < rawLines.length; index++) {
+		const line = stripGaussianComment(rawLines[index]).trim();
+
+		if (line.length === 0) {
+			break;
+		}
+
+		const translationVector = parseGaussianTranslationVectorLine(line);
+
+		if (translationVector) {
+			translationVectors.push(translationVector);
+			continue;
+		}
+
+		const atom = parseGaussianCartesianAtomLine(line);
+
+		if (!atom) {
+			if (atoms.length === 0) {
+				throw new Error(
+					'Gaussian molecule specification does not appear to be supported Cartesian x y z format. AtomView does not currently support Gaussian Z-matrix or mixed internal-coordinate molecule specifications.'
+				);
+			}
+
+			break;
+		}
+
+		atoms.push(atom);
+	}
+
+	return { atoms, translationVectors };
+}
+
+function stripGaussianComment(line: string): string {
+	const commentIndex = line.indexOf('!');
+	return commentIndex >= 0 ? line.slice(0, commentIndex) : line;
+}
+
+function parseGaussianTranslationVectorLine(line: string): Vec3 | undefined {
+	const tokens = line.trim().split(/\s+/);
+
+	if (tokens.length < 4 || tokens[0].toUpperCase() !== 'TV') {
+		return undefined;
+	}
+
+	const vector: Vec3 = [
+		Number(tokens[1]),
+		Number(tokens[2]),
+		Number(tokens[3])
+	];
+
+	if (vector.some((value) => !Number.isFinite(value))) {
+		throw new Error(`Invalid Gaussian TV line: ${line}`);
+	}
+
+	return vector;
+}
+
+function parseGaussianCartesianAtomLine(line: string): Atom | undefined {
+	const tokens = line.trim().split(/\s+/);
+
+	if (tokens.length < 4) {
+		return undefined;
+	}
+
+	const atomSpec = parseGaussianAtomSpec(tokens[0]);
+
+	if (!atomSpec) {
+		return undefined;
+	}
+
+	let coordinateStartIndex = 1;
+	const freezeCode = parseGaussianFreezeCode(tokens[coordinateStartIndex]);
+
+	if (freezeCode !== undefined) {
+		coordinateStartIndex += 1;
+	}
+
+	const coordinateTokens = tokens.slice(coordinateStartIndex, coordinateStartIndex + 3);
+
+	if (coordinateTokens.length < 3 || !coordinateTokens.every(isPlainNumberToken)) {
+		return undefined;
+	}
+
+	const position: Vec3 = [
+		gaussianNumberToNumber(coordinateTokens[0]),
+		gaussianNumberToNumber(coordinateTokens[1]),
+		gaussianNumberToNumber(coordinateTokens[2])
+	];
+
+	if (position.some((value) => !Number.isFinite(value))) {
+		return undefined;
+	}
+
+	return {
+		element: atomSpec.element,
+		selectiveDynamics: gaussianFreezeCodeToSelectiveDynamics(freezeCode),
+		position
+	};
+}
+
+function parseGaussianAtomSpec(token: string): GaussianAtomSpec | undefined {
+	let atomToken = token.trim();
+	let parameters: string | undefined;
+
+	const parameterMatch = atomToken.match(/^(.*?)\((.*)\)$/);
+
+	if (parameterMatch) {
+		atomToken = parameterMatch[1];
+		parameters = parameterMatch[2];
+	}
+
+	if (/^\d+$/.test(atomToken)) {
+		const element = atomicNumberToSymbol(Number(atomToken));
+		return element ? { element, parameters } : undefined;
+	}
+
+	const elementPart = atomToken.split('-')[0];
+	const element = parseElementFromGaussianLabel(elementPart);
+
+	return element ? { element, parameters } : undefined;
+}
+
+function parseElementFromGaussianLabel(label: string): string | undefined {
+	const trimmed = label.trim();
+
+	if (!trimmed) {
+		return undefined;
+	}
+
+	const twoLetterCandidate = trimmed.slice(0, 2);
+
+	if (twoLetterCandidate.length === 2 && isValidElementSymbol(normalizeElementSymbol(twoLetterCandidate))) {
+		return normalizeElementSymbol(twoLetterCandidate);
+	}
+
+	const oneLetterCandidate = trimmed.slice(0, 1);
+
+	if (isValidElementSymbol(normalizeElementSymbol(oneLetterCandidate))) {
+		return normalizeElementSymbol(oneLetterCandidate);
+	}
+
+	return undefined;
+}
+
+function parseGaussianFreezeCode(token: string | undefined): number | undefined {
+	if (!token || !/^[-+]?\d+$/.test(token)) {
+		return undefined;
+	}
+
+	return Number(token);
+}
+
+function gaussianFreezeCodeToSelectiveDynamics(
+	freezeCode: number | undefined
+): [boolean, boolean, boolean] | undefined {
+	if (freezeCode === undefined) {
+		return undefined;
+	}
+
+	return freezeCode < 0
+		? [false, false, false]
+		: [true, true, true];
+}
+
+function gaussianTranslationVectorsToLattice(
+	translationVectors: Vec3[]
+): [Vec3, Vec3, Vec3] | undefined {
+	if (translationVectors.length === 0) {
+		return undefined;
+	}
+
+	if (translationVectors.length > 3) {
+		throw new Error('Gaussian molecule specification contains more than three TV lines.');
+	}
+
+	const lattice: [Vec3, Vec3, Vec3] = [
+		[0, 0, 0],
+		[0, 0, 0],
+		[0, 0, 0]
+	];
+
+	for (let index = 0; index < translationVectors.length; index++) {
+		lattice[index] = translationVectors[index];
+	}
+
+	return lattice;
+}
+
+function isPlainNumberToken(token: string): boolean {
+	return /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][-+]?\d+)?$/.test(token);
+}
+
+function gaussianNumberToNumber(token: string): number {
+	return Number(token.replace(/[Dd]/, 'E'));
+}
+
+function isValidElementSymbol(symbol: string): boolean {
+	return ELEMENT_SYMBOLS.has(symbol);
+}
+
+function atomicNumberToSymbol(atomicNumber: number): string | undefined {
+	return ELEMENT_SYMBOLS_BY_ATOMIC_NUMBER[atomicNumber];
+}
+
+/* -------------------------------------------------------------------------- */
+/* Quantum ESPRESSO                                                           */
+/* -------------------------------------------------------------------------- */
+
+function parseQuantumEspressoInput(text: string): AtomicStructure {
+	const lines = preprocessQeLines(text);
+	const systemValues = parseQeNamelist(lines, 'system');
+	
+	const ibrav = parseQeIbrav(systemValues);
+
+	if (ibrav !== undefined && ibrav !== 0) {
+		throw new Error(`Quantum ESPRESSO ibrav = ${ibrav} is not supported yet. AtomView currently supports QE inputs with ibrav = 0 and explicit CELL_PARAMETERS.`);
+	}
+
+	const title =
+		parseQeNamelist(lines, 'control').get('prefix') ??
+		'Quantum ESPRESSO input';
+
+	const alat = parseQeAlatAngstrom(systemValues);
+	const lattice = parseQeLattice(lines, alat);
+	const speciesMap = parseQeSpeciesMap(lines);
+	const { atoms, coordinateMode } = parseQeAtoms(lines, speciesMap, lattice, alat);
+
+	if (atoms.length === 0) {
+		throw new Error('No atoms found in ATOMIC_POSITIONS.');
+	}
+
+	return {
+		title,
+		lattice,
+		atoms,
+		coordinateMode,
+		sourceFormat: 'QE'
+	};
+}
+
+function preprocessQeLines(text: string): string[] {
+	return text
+		.split(/\r?\n/)
+		.map((line) => {
+			const commentIndex = line.indexOf('!');
+			return commentIndex >= 0 ? line.slice(0, commentIndex).trim() : line.trim();
+		})
+		.filter((line) => line.length > 0);
+}
+
+function parseQeNamelist(lines: string[], name: string): Map<string, string> {
+	const values = new Map<string, string>();
+	const lowerName = `&${name.toLowerCase()}`;
+	const startIndex = lines.findIndex((line) => line.toLowerCase().startsWith(lowerName));
+
+	if (startIndex < 0) {
+		return values;
+	}
+
+	for (let index = startIndex + 1; index < lines.length; index++) {
+		const line = lines[index];
+
+		if (line.trim() === '/') {
+			break;
+		}
+
+		for (const assignment of line.split(',')) {
+			const match = assignment.match(/^\s*([a-zA-Z0-9_().]+)\s*=\s*(.+?)\s*$/);
+
+			if (!match) {
+				continue;
+			}
+
+			values.set(
+				match[1].toLowerCase(),
+				match[2].replace(/^['"]|['"]$/g, '').trim()
+			);
+		}
+	}
+
+	return values;
+}
+
+function parseQeIbrav(systemValues: Map<string, string>): number | undefined {
+	const value = systemValues.get('ibrav');
+
+	if (value === undefined) {
+		return undefined;
+	}
+
+	const parsed = Number(value);
+
+	if (!Number.isInteger(parsed)) {
+		throw new Error(`Invalid QE ibrav value: ${value}`);
+	}
+
+	return parsed;
+}
+
+function parseQeAlatAngstrom(systemValues: Map<string, string>): number {
+	const aValue = systemValues.get('a');
+
+	if (aValue !== undefined) {
+		const a = Number(aValue);
+		if (Number.isFinite(a)) {
+			return a;
+		}
+	}
+
+	const celldm1Value = systemValues.get('celldm(1)');
+
+	if (celldm1Value !== undefined) {
+		const celldm1 = Number(celldm1Value);
+		if (Number.isFinite(celldm1)) {
+			return celldm1 * lengthUnitToAngstrom('Bohr');
+		}
+	}
+
+	return 1.0;
+}
+
+function parseQeLattice(lines: string[], alat: number): [Vec3, Vec3, Vec3] {
+	const headerIndex = lines.findIndex((line) =>
+		line.toLowerCase().startsWith('cell_parameters')
+	);
+
+	if (headerIndex < 0) {
+		throw new Error('QE parser currently requires explicit CELL_PARAMETERS. AtomView supports QE inputs with ibrav = 0; Bravais-lattice construction from ibrav/a/b/c/celldm is not implemented yet.');
+	}
+
+	if (lines.length < headerIndex + 4) {
+		throw new Error('CELL_PARAMETERS must be followed by three lattice vectors.');
+	}
+
+	const header = lines[headerIndex];
+	const unit = parseQeHeaderUnit(header) ?? 'alat';
+	const scale = qeLengthScaleToAngstrom(unit, alat);
+
+	return [
+		scaleVector(parseVector(lines[headerIndex + 1]), scale),
+		scaleVector(parseVector(lines[headerIndex + 2]), scale),
+		scaleVector(parseVector(lines[headerIndex + 3]), scale)
+	];
+}
+
+function parseQeSpeciesMap(lines: string[]): Map<string, string> {
+	const speciesMap = new Map<string, string>();
+	const headerIndex = lines.findIndex((line) =>
+		line.toLowerCase().startsWith('atomic_species')
+	);
+
+	if (headerIndex < 0) {
+		return speciesMap;
+	}
+
+	for (let index = headerIndex + 1; index < lines.length; index++) {
+		const line = lines[index];
+
+		if (isQeSectionHeader(line)) {
+			break;
+		}
+
+		const tokens = line.split(/\s+/);
+
+		if (tokens.length >= 1) {
+			speciesMap.set(tokens[0], normalizeElementSymbol(tokens[0]));
+		}
+	}
+
+	return speciesMap;
+}
+
+function parseQeAtoms(
+	lines: string[],
+	speciesMap: Map<string, string>,
+	lattice: [Vec3, Vec3, Vec3],
+	alat: number
+): { atoms: Atom[]; coordinateMode: 'Direct' | 'Cartesian' } {
+	const headerIndex = lines.findIndex((line) =>
+		line.toLowerCase().startsWith('atomic_positions')
+	);
+
+	if (headerIndex < 0) {
+		throw new Error('Missing ATOMIC_POSITIONS.');
+	}
+
+	const unit = parseQeHeaderUnit(lines[headerIndex]) ?? 'alat';
+	const coordinateFormat = parseQeCoordinateFormat(unit);
+	const atoms: Atom[] = [];
+
+	for (let index = headerIndex + 1; index < lines.length; index++) {
+		const line = lines[index];
+
+		if (isQeSectionHeader(line)) {
+			break;
+		}
+
+		const tokens = line.split(/\s+/);
+
+		if (tokens.length < 4) {
+			continue;
+		}
+
+		const label = tokens[0];
+		const rawPosition: Vec3 = [
+			Number(tokens[1]),
+			Number(tokens[2]),
+			Number(tokens[3])
+		];
+
+		if (rawPosition.some((value) => !Number.isFinite(value))) {
+			throw new Error(`Invalid ATOMIC_POSITIONS line: ${line}`);
+		}
+
+		const selectiveDynamics = parseQeIfPosFlags(tokens.slice(4, 7));
+		const element = speciesMap.get(label) ?? normalizeElementSymbol(label);
+
+		if (coordinateFormat === 'Crystal') {
+			atoms.push({
+				element,
+				fractionalPosition: rawPosition,
+				selectiveDynamics,
+				position: fractionalToCartesian(rawPosition, lattice)
+			});
+		} else if (coordinateFormat === 'CartesianAngstrom') {
+			atoms.push({
+				element,
+				selectiveDynamics,
+				position: rawPosition
+			});
+		} else if (coordinateFormat === 'CartesianBohr') {
+			atoms.push({
+				element,
+				selectiveDynamics,
+				position: scaleVector(rawPosition, lengthUnitToAngstrom('Bohr'))
+			});
+		} else {
+			atoms.push({
+				element,
+				selectiveDynamics,
+				position: scaleVector(rawPosition, alat)
+			});
+		}
+	}
+
+	return {
+		atoms,
+		coordinateMode: coordinateFormat === 'Crystal' ? 'Direct' : 'Cartesian'
+	};
+}
+
+function parseQeHeaderUnit(header: string): string | undefined {
+	const braceMatch = header.match(/\{\s*([^}]+)\s*\}/);
+
+	if (braceMatch) {
+		return braceMatch[1].trim().toLowerCase();
+	}
+
+	const parenMatch = header.match(/\(\s*([^)]+)\s*\)/);
+
+	if (parenMatch) {
+		return parenMatch[1].trim().toLowerCase();
+	}
+
+	const tokens = header.split(/\s+/);
+
+	return tokens[1]?.toLowerCase();
+}
+
+function parseQeCoordinateFormat(unit: string): QeCoordinateFormat {
+	const normalized = unit.toLowerCase();
+
+	if (normalized.startsWith('crystal')) {
+		return 'Crystal';
+	}
+
+	if (normalized.startsWith('ang')) {
+		return 'CartesianAngstrom';
+	}
+
+	if (normalized.startsWith('bohr')) {
+		return 'CartesianBohr';
+	}
+
+	if (normalized.startsWith('alat')) {
+		return 'Alat';
+	}
+
+	throw new Error(`Unsupported ATOMIC_POSITIONS unit: ${unit}`);
+}
+
+function qeLengthScaleToAngstrom(unit: string, alat: number): number {
+	const normalized = unit.toLowerCase();
+
+	if (normalized.startsWith('ang')) {
+		return 1.0;
+	}
+
+	if (normalized.startsWith('bohr')) {
+		return lengthUnitToAngstrom('Bohr');
+	}
+
+	if (normalized.startsWith('alat')) {
+		return alat;
+	}
+
+	throw new Error(`Unsupported CELL_PARAMETERS unit: ${unit}`);
+}
+
+function parseQeIfPosFlags(tokens: string[]): [boolean, boolean, boolean] | undefined {
+	if (tokens.length < 3) {
+		return undefined;
+	}
+
+	const parsed = tokens.map((token) => {
+		if (token === '1') {
+			return true;
+		}
+
+		if (token === '0') {
+			return false;
+		}
+
+		return undefined;
+	});
+
+	if (parsed.some((value) => value === undefined)) {
+		return undefined;
+	}
+
+	return parsed as [boolean, boolean, boolean];
+}
+
+function isQeSectionHeader(line: string): boolean {
+	const lower = line.toLowerCase();
+
+	return (
+		lower.startsWith('&') ||
+		lower === '/' ||
+		lower.startsWith('atomic_species') ||
+		lower.startsWith('atomic_positions') ||
+		lower.startsWith('cell_parameters') ||
+		lower.startsWith('k_points') ||
+		lower.startsWith('occupations') ||
+		lower.startsWith('constraints')
+	);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Shared helpers                                                             */
+/* -------------------------------------------------------------------------- */
+
+const ELEMENT_SYMBOLS_BY_ATOMIC_NUMBER = [
+	'',
+	'H', 'He', 'Li', 'Be', 'B', 'C', 'N', 'O', 'F', 'Ne',
+	'Na', 'Mg', 'Al', 'Si', 'P', 'S', 'Cl', 'Ar', 'K', 'Ca',
+	'Sc', 'Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn',
+	'Ga', 'Ge', 'As', 'Se', 'Br', 'Kr', 'Rb', 'Sr', 'Y', 'Zr',
+	'Nb', 'Mo', 'Tc', 'Ru', 'Rh', 'Pd', 'Ag', 'Cd', 'In', 'Sn',
+	'Sb', 'Te', 'I', 'Xe', 'Cs', 'Ba', 'La', 'Ce', 'Pr', 'Nd',
+	'Pm', 'Sm', 'Eu', 'Gd', 'Tb', 'Dy', 'Ho', 'Er', 'Tm', 'Yb',
+	'Lu', 'Hf', 'Ta', 'W', 'Re', 'Os', 'Ir', 'Pt', 'Au', 'Hg',
+	'Tl', 'Pb', 'Bi', 'Po', 'At', 'Rn', 'Fr', 'Ra', 'Ac', 'Th',
+	'Pa', 'U', 'Np', 'Pu', 'Am', 'Cm', 'Bk', 'Cf', 'Es', 'Fm',
+	'Md', 'No', 'Lr', 'Rf', 'Db', 'Sg', 'Bh', 'Hs', 'Mt', 'Ds',
+	'Rg', 'Cn', 'Nh', 'Fl', 'Mc', 'Lv', 'Ts', 'Og'
+];
+
+const ELEMENT_SYMBOLS = new Set(ELEMENT_SYMBOLS_BY_ATOMIC_NUMBER.filter(Boolean));
 
 function validateElementList(elementSymbols: string[], elementCounts: number[]) {
 	if (

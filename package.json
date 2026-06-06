@@ -1,7 +1,7 @@
 {
 	"name": "atomview",
-	"description": "Lightweight live atomic structure preview for VASP POSCAR files inside VS Code",
-	"version": "0.2.1",
+	"description": "Lightweight live atomic structure preview inside VS Code",
+	"version": "0.3.0",
 	"publisher": "PurunSimonCao",
 	"private": false,
 	"repository": {
@@ -12,6 +12,7 @@
 	"engines": {
 		"vscode": "^1.100.0"
 	},
+	"icon": "media/icon.png",
 	"categories": [
 		"Other"
 	],
@@ -34,7 +35,7 @@
 				{
 					"command": "atomview.openPreview",
 					"group": "navigation",
-					"when": "resourceFilename == POSCAR || resourceFilename == CONTCAR || resourceFilename == XDATCAR || resourceExtname =~ /\\.[vV][aA][sS][pP]/"
+					"when": "resourceFilename =~ /.*[Pp][Oo][Ss][Cc][Aa][Rr].*/ || resourceFilename =~ /.*[Cc][Oo][Nn][Tt][Cc][Aa][Rr].*/ || resourceFilename =~ /.*[Xx][Dd][Aa][Tt][Cc][Aa][Rr].*/ || resourceExtname =~ /\\.[vV][aA][sS][pP]/ || resourceExtname =~ /\\.[iI][nN]/ || resourceExtname =~ /\\.[fF][dD][fF]/ || resourceExtname =~ /\\.[gG][jJ][fF]/"
 				}
 			]
 		}

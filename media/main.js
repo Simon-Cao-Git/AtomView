@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
 
 let scene;
 let camera;
@@ -7,6 +7,7 @@ let renderer;
 let controls;
 let currentStructureGroup;
 let currentBondGroup;
+let currentLatticeSignature;
 let statusElement;
 let latestStructure;
 let hoverElement;
@@ -34,9 +35,12 @@ const BOND_RADIUS = 0.06;
 const DASHED_BOND_RADIUS = 0.035;
 const DASH_SEGMENT_LENGTH = 0.16;
 const DASH_GAP_LENGTH = 0.10;
-const SLOWEST_PLAYBACK_INTERVAL_MS = 300;
+const SLOWEST_PLAYBACK_INTERVAL_MS = 200;
 const FASTEST_PLAYBACK_INTERVAL_MS = 30;
 const TARGET_TRAJECTORY_LOOP_SECONDS = 30;
+const TRACKBALL_ROTATE_SPEED = 2.0;
+const TRACKBALL_ZOOM_SPEED = 1.2;
+const TRACKBALL_PAN_SPEED = 0.8;
 
 initViewer();
 
@@ -51,6 +55,8 @@ window.addEventListener('message', (event) => {
 	if (message.command === 'showStructure') {
 		const hadStructure = Boolean(latestStructure);
 		const previousFrameIndex = currentFrameIndex;
+		const incomingLatticeSignature = getLatticeSignature(message.structure?.lattice);
+		const latticeChanged = incomingLatticeSignature !== currentLatticeSignature;
 		latestStructure = message.structure;
 
 		if (!hadStructure) {
@@ -64,7 +70,10 @@ window.addEventListener('message', (event) => {
 
 		showStatus('');
 		updateFrameSlider();
-		renderCurrentFrame({ preserveCamera: hadStructure });
+		renderCurrentFrame({
+			preserveCamera: hadStructure,
+			forceFullRender: latticeChanged
+		});
 	}
 });
 
@@ -226,9 +235,7 @@ function initViewer() {
 	container.appendChild(renderer.domElement);
 	initAxisViewer();
 
-	controls = new OrbitControls(camera, renderer.domElement);
-	controls.enableDamping = false;
-	controls.screenSpacePanning = true;
+	controls = createTrackballControls();
 
 	raycaster = new THREE.Raycaster();
 	pointer = new THREE.Vector2();
@@ -243,12 +250,25 @@ function initViewer() {
 
 	window.addEventListener('resize', () => {
 		renderer.setSize(window.innerWidth, window.innerHeight);
+		controls?.handleResize();
 		if (latestStructure) {
 			fitCameraToStructure(getCurrentFrameStructure(), currentViewVectorIndex);
 		}
 	});
 
 	animate();
+}
+
+function createTrackballControls() {
+	const trackballControls = new TrackballControls(camera, renderer.domElement);
+	trackballControls.rotateSpeed = TRACKBALL_ROTATE_SPEED;
+	trackballControls.zoomSpeed = TRACKBALL_ZOOM_SPEED;
+	trackballControls.panSpeed = TRACKBALL_PAN_SPEED;
+	trackballControls.noRoll = false;
+	trackballControls.staticMoving = true;
+	trackballControls.dynamicDampingFactor = 0.0;
+	trackballControls.target.set(0, 0, 0);
+	return trackballControls;
 }
 
 function animate() {
@@ -319,6 +339,14 @@ function renderAxisViewer() {
 
 function updateLatticeAxisViewer(lattice) {
 	if (!axisScene) {
+		return;
+	}
+
+	if (!hasUsableLattice(lattice)) {
+		if (latticeAxisGroup) {
+			axisScene.remove(latticeAxisGroup);
+			latticeAxisGroup = undefined;
+		}
 		return;
 	}
 
@@ -410,10 +438,7 @@ function toggleCameraProjection() {
 	camera.lookAt(0, 0, 0);
 
 	controls.dispose();
-	controls = new OrbitControls(camera, renderer.domElement);
-	controls.enableDamping = false;
-	controls.screenSpacePanning = true;
-	controls.target.set(0, 0, 0);
+	controls = createTrackballControls();
 
 	if (latestStructure) {
 		fitCameraToStructure(getCurrentFrameStructure(), currentViewVectorIndex);
@@ -459,6 +484,7 @@ function renderCurrentFrame(options = {}) {
 
 	if (
 		options.preserveCamera === true &&
+		options.forceFullRender !== true &&
 		tryUpdateAtomPositionsOnly(frameStructure)
 	) {
 		updateFrameLabel();
@@ -630,6 +656,7 @@ function renderStructure(structure, options = {}) {
 	const preserveCamera = options.preserveCamera === true;
 	const previousCameraState = preserveCamera ? captureCameraState() : undefined;
 	updateFrameLabel();
+	currentLatticeSignature = getLatticeSignature(structure.lattice);
 
 	if (currentStructureGroup) {
 		scene.remove(currentStructureGroup);
@@ -644,7 +671,9 @@ function renderStructure(structure, options = {}) {
 	drawBonds(structure, currentBondGroup);
 	currentStructureGroup.add(currentBondGroup);
 	drawAtoms(structure, currentStructureGroup);
-	drawUnitCell(structure.lattice, currentStructureGroup);
+	if (hasUsableLattice(structure.lattice)) {
+		drawUnitCell(structure.lattice, currentStructureGroup);
+	}
 
 	scene.add(currentStructureGroup);
 	updateLatticeAxisViewer(structure.lattice);
@@ -712,6 +741,7 @@ function restoreCameraState(state) {
 	camera.position.copy(state.position);
 	camera.up.copy(state.up);
 	controls.target.copy(state.target);
+	controls.object = camera;
 
 	if (camera.isOrthographicCamera && !state.isPerspective) {
 		camera.left = state.left;
@@ -825,15 +855,15 @@ function showAtomHoverInfo(atom, atomIndex, frameIndex, coordinateMode) {
 
 	if (coordinateMode === 'Direct' && atom.fractionalPosition) {
 		lines.push(`Direct: ${formatVector(atom.fractionalPosition)}`);
-	} else {
-		lines.push(`Cartesian: ${formatVector(atom.position)}`);
 	}
+
+	lines.push(`Cartesian: ${formatVector(atom.position)}`);
 
 	if (Array.isArray(atom.selectiveDynamics)) {
 		const flags = atom.selectiveDynamics
-			.map((canMove) => canMove ? 'T' : 'F')
+			.map((canMove) => canMove ? 'Free' : 'Fixed')
 			.join(' ');
-		lines.push(`Selective dynamics: ${flags}`);
+		lines.push(`Movement: ${flags}`);
 	}
 
 	hoverElement.textContent = lines.join('\n');
@@ -936,9 +966,24 @@ function createBondCylinder(start, end, radius = BOND_RADIUS, color = 0xd0d0d0) 
 }
 
 function drawUnitCell(lattice, group) {
-	const a = new THREE.Vector3(...lattice[0]);
-	const b = new THREE.Vector3(...lattice[1]);
-	const c = new THREE.Vector3(...lattice[2]);
+	if (!hasUsableLattice(lattice)) {
+		return;
+	}
+
+	const vectors = lattice.map((vector) => new THREE.Vector3(...vector));
+	const nonzeroVectors = vectors.filter((vector) => vector.lengthSq() > 1e-12);
+
+	if (nonzeroVectors.length === 1) {
+		drawOneDimensionalCell(nonzeroVectors[0], group);
+		return;
+	}
+
+	if (nonzeroVectors.length === 2) {
+		drawTwoDimensionalCell(nonzeroVectors[0], nonzeroVectors[1], group);
+		return;
+	}
+
+	const [a, b, c] = vectors;
 
 	const corners = [
 		new THREE.Vector3(0, 0, 0),
@@ -959,7 +1004,61 @@ function drawUnitCell(lattice, group) {
 		[4, 7], [5, 7], [6, 7]
 	];
 
+	drawLineSegmentsFromEdges(corners, edges, group);
+}
+
+function hasUsableLattice(lattice) {
+	return Array.isArray(lattice) &&
+		lattice.length >= 3 &&
+		lattice.some((vector) =>
+			Array.isArray(vector) &&
+			vector.length >= 3 &&
+			new THREE.Vector3(...vector).lengthSq() > 1e-12
+		);
+}
+
+function getLatticeSignature(lattice) {
+	if (!Array.isArray(lattice)) {
+		return 'none';
+	}
+
+	return lattice
+		.map((vector) => Array.isArray(vector)
+			? vector.slice(0, 3).map((value) => Number(value).toFixed(8)).join(',')
+			: 'invalid'
+		)
+		.join('|');
+}
+
+function drawOneDimensionalCell(vector, group) {
+	const start = vector.clone().multiplyScalar(-0.5);
+	const end = vector.clone().multiplyScalar(0.5);
+	const geometry = new THREE.BufferGeometry().setFromPoints([start, end]);
+	const material = new THREE.LineBasicMaterial({ color: 0xffffff });
+	group.add(new THREE.LineSegments(geometry, material));
+}
+
+function drawTwoDimensionalCell(vectorA, vectorB, group) {
+	const halfA = vectorA.clone().multiplyScalar(0.5);
+	const halfB = vectorB.clone().multiplyScalar(0.5);
+
+	const corners = [
+		halfA.clone().add(halfB),
+		halfA.clone().sub(halfB),
+		halfA.clone().multiplyScalar(-1).sub(halfB),
+		halfA.clone().multiplyScalar(-1).add(halfB)
+	];
+
+	const edges = [
+		[0, 1], [1, 2], [2, 3], [3, 0]
+	];
+
+	drawLineSegmentsFromEdges(corners, edges, group);
+}
+
+function drawLineSegmentsFromEdges(corners, edges, group) {
 	const points = [];
+
 	for (const [i, j] of edges) {
 		points.push(corners[i], corners[j]);
 	}
@@ -983,24 +1082,22 @@ function fitCameraToStructure(structure, viewVectorIndex = 2) {
 
 	currentStructureGroup.position.sub(center);
 
-	const a = new THREE.Vector3(...structure.lattice[0]);
-	const b = new THREE.Vector3(...structure.lattice[1]);
-	const c = new THREE.Vector3(...structure.lattice[2]);
-	const latticeVectors = [a, b, c];
+	const latticeVectors = hasUsableLattice(structure.lattice)
+		? structure.lattice.map((vector) => new THREE.Vector3(...vector))
+		: [];
+	const fallbackViewDirection = new THREE.Vector3(0, 0, 1);
 
-	let viewDirection = latticeVectors[viewVectorIndex]?.clone() ?? c.clone();
+	let viewDirection = latticeVectors[viewVectorIndex]?.clone() ?? fallbackViewDirection.clone();
 	if (viewDirection.lengthSq() < 1e-12) {
-		viewDirection = new THREE.Vector3(0, 0, 1);
-	} else {
-		viewDirection.normalize();
+		viewDirection = latticeVectors.find((vector) => vector.lengthSq() > 1e-12)?.clone() ?? fallbackViewDirection.clone();
 	}
+	viewDirection.normalize();
 
-	let upDirection;
-	if (viewVectorIndex === 0) {
-		upDirection = c.clone();
-	} else {
-		upDirection = b.clone();
-	}
+	let upDirection = latticeVectors.find((vector, index) =>
+		index !== viewVectorIndex &&
+		vector.lengthSq() > 1e-12 &&
+		Math.abs(vector.clone().normalize().dot(viewDirection)) < 0.98
+	)?.clone() ?? new THREE.Vector3(0, 1, 0);
 
 	if (upDirection.lengthSq() < 1e-12 || Math.abs(upDirection.clone().normalize().dot(viewDirection)) > 0.98) {
 		upDirection = new THREE.Vector3(0, 1, 0);
