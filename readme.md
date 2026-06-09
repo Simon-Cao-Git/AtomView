@@ -20,36 +20,38 @@ Install directly from the VS Marketplace:
 - Visualization of **VASP** structures (`POSCAR`, `CONTCAR`, `.vasp`) and trajectories (`XDATCAR`) with frame navigation and playback controls
 - Visualization of **SIESTA** (`.fdf`) structures
 - Visualization of **Quantum ESPRESSO** (`.in`) structures
-- Limited visualization of **Gaussian** (`.gjf`) structures
+- Visualization of **Gaussian** (`.gjf`) structures
 - Automatic live refresh on file changes
-- Atom hover inspection with coordinate display
+- Atom hover inspection with coordinate and constraint information
 - Highlighting for constrained atoms
-- Bond rendering based on element-specific bonding data
+- Bond rendering using element-specific distance cutoffs
 - Lightweight workflow-oriented design
 
-### Format Support Notes
+#### Format-Specific Notes
 
 #### VASP
 - Supports `POSCAR`, `CONTCAR`, `XDATCAR`, and `.vasp`
 - Supports multi-frame trajectory playback for `XDATCAR` and stacked `.vasp` files
 - Files are recognized when their names contain `POSCAR`, `CONTCAR`, or `XDATCAR` (case-insensitive)
-- Supports coordinate constraints (`Selective Dynamics` flags)
+- Supports coordinate constraints (`Selective Dynamics`)
 
 #### SIESTA (`.fdf`)
 - Z-matrix-based structure definitions are not currently supported
-- Constraint parsing is not currently implemented
+- Supports coordinate constraints defined through `Geometry.Constraints`
+- Constraints that do not act on individual atoms (`center`, `rigid`, `molecule`, `rigid-max`, `molecule-max`, `cell-angle`, `cell-vector`, `stress`, `routine`) are not currently visualized
 
 #### Quantum ESPRESSO (`.in`)
-- Nonzero `ibrav` values is not currently supported; explicit `CELL_PARAMETERS` are required
-- Symmetry expansion from space-group information (`crystal_sg`) are not currently supported; all atoms must be explicitly listed in `ATOMIC_POSITIONS`
-- Supports coordinate constraints
+- Nonzero `ibrav` values are not currently supported; explicit `CELL_PARAMETERS` are required
+- Space-group expansion (`crystal_sg`) is not currently supported; all atoms must be explicitly listed in `ATOMIC_POSITIONS`
+- Supports coordinate constraints (`if_pos`)
 
 #### Gaussian (`.gjf`)
 - Supports Cartesian-coordinate molecule specifications only
 - Z-matrix and other internal-coordinate molecule specifications are not currently supported
-- Supports coordinate constraints (freeze-code)
+- Supports coordinate constraints (`freeze-code`)
 - Supports periodic translation vectors (`TV`)
-- MM atom types, charges, connectivity, force-field, basis-set, and other parameters are not interpreted for visualization
+- Trailing atom indices, MM atom types, charges, isotopes, fragments, and other parameters are ignored for visualization
+- Explicit connectivity information is not used for bond generation
 
 ## Planned Features
 
@@ -57,6 +59,9 @@ Install directly from the VS Marketplace:
 - Additional structure format support (`.cif`, `.xyz`, etc.)
 
 ## Release Notes
+
+### 0.3.1
+- Added support for SIESTA `Geometry.Constraints` coordinate constraints
 
 ### 0.3.0
 - Added SIESTA (`.fdf`) support

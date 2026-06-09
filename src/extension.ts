@@ -18,6 +18,8 @@ interface Atom {
 	position: Vec3; // Cartesian coordinates in Angstrom
 	fractionalPosition?: Vec3;
 	selectiveDynamics?: [boolean, boolean, boolean];
+	fdfSpeciesIndex?: number;
+	projectedForceConstraints?: Vec3[];
 }
 
 interface TrajectoryFrame {
@@ -707,6 +709,7 @@ function parseSiestaFdf(text: string): AtomicStructure {
 	const latticeConstant = parseFdfLatticeConstant(lines);
 	const lattice = parseFdfLattice(lines, latticeConstant);
 	const speciesMap = parseFdfSpeciesMap(lines);
+	const speciesAtomicNumbers = parseFdfSpeciesAtomicNumberMap(lines);
 	const coordinateFormat = parseFdfCoordinateFormat(lines);
 	const atoms = parseFdfAtoms(
 		lines,
@@ -715,6 +718,8 @@ function parseSiestaFdf(text: string): AtomicStructure {
 		latticeConstant,
 		coordinateFormat
 	);
+
+	applyFdfGeometryConstraints(lines, atoms, speciesAtomicNumbers);
 
 	if (atoms.length === 0) {
 		throw new Error('No atoms found in %block AtomicCoordinatesAndAtomicSpecies.');
@@ -903,6 +908,27 @@ function parseFdfSpeciesMap(lines: FdfLine[]): Map<number, string> {
 	return speciesMap;
 }
 
+function parseFdfSpeciesAtomicNumberMap(lines: FdfLine[]): Map<number, number> {
+	const speciesBlock = getFdfBlock(lines, 'ChemicalSpeciesLabel');
+	const speciesAtomicNumbers = new Map<number, number>();
+
+	if (!speciesBlock) {
+		return speciesAtomicNumbers;
+	}
+
+	for (const line of speciesBlock) {
+		const tokens = line.split(/\s+/);
+		const speciesIndex = parseInt(tokens[0], 10);
+		const atomicNumber = parseInt(tokens[1], 10);
+
+		if (Number.isInteger(speciesIndex) && Number.isInteger(atomicNumber)) {
+			speciesAtomicNumbers.set(speciesIndex, atomicNumber);
+		}
+	}
+
+	return speciesAtomicNumbers;
+}
+
 function parseFdfCoordinateFormat(lines: FdfLine[]): FdfCoordinateFormat {
 	const line = findFdfLine(lines, 'AtomicCoordinatesFormat');
 	const value = line?.clean.split(/\s+/)[1]?.toLowerCase() ?? 'bohr';
@@ -963,6 +989,7 @@ function parseFdfAtoms(
 		if (coordinateFormat === 'Fractional') {
 			return {
 				element,
+				fdfSpeciesIndex: speciesIndex,
 				fractionalPosition: rawPosition,
 				selectiveDynamics,
 				position: fractionalToCartesian(rawPosition, lattice)
@@ -972,6 +999,7 @@ function parseFdfAtoms(
 		if (coordinateFormat === 'CartesianAngstrom') {
 			return {
 				element,
+				fdfSpeciesIndex: speciesIndex,
 				selectiveDynamics,
 				position: rawPosition
 			};
@@ -980,6 +1008,7 @@ function parseFdfAtoms(
 		if (coordinateFormat === 'CartesianBohr') {
 			return {
 				element,
+				fdfSpeciesIndex: speciesIndex,
 				selectiveDynamics,
 				position: scaleVector(rawPosition, lengthUnitToAngstrom('Bohr'))
 			};
@@ -987,10 +1016,522 @@ function parseFdfAtoms(
 
 		return {
 			element,
+			fdfSpeciesIndex: speciesIndex,
 			selectiveDynamics,
 			position: scaleVector(rawPosition, latticeConstant)
 		};
 	});
+}
+
+interface FdfConstraintEffect {
+	atomIndices: number[];
+	kind: 'full' | 'axis' | 'projected';
+	motionFlags?: [boolean, boolean, boolean];
+	vector?: Vec3;
+}
+
+interface FdfConstraintOperation {
+	type: 'constraint' | 'clear' | 'clear-prev';
+	effects?: FdfConstraintEffect[];
+	atomIndices?: number[];
+	targetConstraintOperationIndex?: number;
+}
+
+function applyFdfGeometryConstraints(
+	lines: FdfLine[],
+	atoms: Atom[],
+	speciesAtomicNumbers: Map<number, number>
+) {
+	const constraintBlock = getFdfBlock(lines, 'Geometry.Constraints');
+
+	if (!constraintBlock) {
+		return;
+	}
+
+	const operations: FdfConstraintOperation[] = [];
+	let previousConstraintOperationIndex: number | undefined;
+
+	for (const line of constraintBlock) {
+		parseFdfGeometryConstraintLineOperations(
+			line,
+			atoms,
+			speciesAtomicNumbers,
+			operations,
+			previousConstraintOperationIndex
+		);
+
+		for (let index = operations.length - 1; index >= 0; index--) {
+			if (operations[index].type === 'constraint') {
+				previousConstraintOperationIndex = index;
+				break;
+			}
+		}
+	}
+
+	const activeEffects = replayFdfConstraintOperations(operations);
+	const motionFlags = atoms.map(() => [true, true, true] as [boolean, boolean, boolean]);
+	const projectedForceConstraints = atoms.map(() => [] as Vec3[]);
+
+	for (const effects of activeEffects) {
+		for (const effect of effects) {
+			for (const atomIndex of effect.atomIndices) {
+				if (effect.kind === 'axis' && effect.motionFlags) {
+					motionFlags[atomIndex] = [
+						motionFlags[atomIndex][0] && effect.motionFlags[0],
+						motionFlags[atomIndex][1] && effect.motionFlags[1],
+						motionFlags[atomIndex][2] && effect.motionFlags[2]
+					];
+				} else if (effect.kind === 'projected' && effect.vector) {
+					projectedForceConstraints[atomIndex].push(effect.vector);
+				} else if (effect.kind === 'full') {
+					motionFlags[atomIndex] = [false, false, false];
+				}
+			}
+		}
+	}
+
+	for (let index = 0; index < atoms.length; index++) {
+		const flags = motionFlags[index];
+
+		if (flags.some((canMove) => !canMove)) {
+			atoms[index].selectiveDynamics = flags;
+		} else {
+			delete atoms[index].selectiveDynamics;
+		}
+
+		if (projectedForceConstraints[index].length > 0) {
+			atoms[index].projectedForceConstraints = projectedForceConstraints[index];
+		} else {
+			delete atoms[index].projectedForceConstraints;
+		}
+	}
+}
+
+function parseFdfGeometryConstraintLineOperations(
+	line: string,
+	atoms: Atom[],
+	speciesAtomicNumbers: Map<number, number>,
+	operations: FdfConstraintOperation[],
+	previousConstraintOperationIndex: number | undefined
+) {
+	const tokens = tokenizeFdfConstraintLine(line);
+	let index = 0;
+
+	while (index < tokens.length) {
+		const keyword = tokens[index].toLowerCase();
+
+		if (keyword === 'clear' || keyword === 'clear-prev') {
+			const parsed = parseFdfConstraintIndexSet(tokens, index + 1, atoms.length, false);
+			index = parsed.nextIndex;
+
+			operations.push({
+				type: keyword,
+				atomIndices: parsed.indices,
+				...(previousConstraintOperationIndex !== undefined
+					? { targetConstraintOperationIndex: previousConstraintOperationIndex }
+					: {})
+			});
+
+			continue;
+		}
+
+		const parsed = parseFdfConstraintSelector(tokens, index, atoms, speciesAtomicNumbers);
+		index = parsed.nextIndex;
+
+		const direction = parseFdfConstraintDirection(tokens, index);
+		index = direction.nextIndex;
+
+		const effects: FdfConstraintEffect[] = [];
+
+		for (const atomIndex of parsed.atomIndices) {
+			if (atomIndex < 0 || atomIndex >= atoms.length) {
+				throw new Error(`Geometry.Constraints atom index ${atomIndex + 1} is out of range.`);
+			}
+		}
+
+		if (parsed.atomIndices.length > 0) {
+			if (direction.kind === 'axis') {
+				effects.push({
+					atomIndices: [...parsed.atomIndices],
+					kind: 'axis',
+					motionFlags: direction.motionFlags
+				});
+			} else if (direction.kind === 'projected') {
+				effects.push({
+					atomIndices: [...parsed.atomIndices],
+					kind: 'projected',
+					vector: direction.vector
+				});
+			} else {
+				effects.push({
+					atomIndices: [...parsed.atomIndices],
+					kind: 'full'
+				});
+			}
+		}
+
+		operations.push({
+			type: 'constraint',
+			effects
+		});
+	}
+}
+
+function replayFdfConstraintOperations(operations: FdfConstraintOperation[]): FdfConstraintEffect[][] {
+	const activeEffects = operations.map(() => [] as FdfConstraintEffect[]);
+
+	for (let operationIndex = 0; operationIndex < operations.length; operationIndex++) {
+		const operation = operations[operationIndex];
+
+		if (operation.type === 'constraint') {
+			activeEffects[operationIndex] = cloneFdfConstraintEffects(operation.effects ?? []);
+			continue;
+		}
+
+		if (!operation.atomIndices || operation.atomIndices.length === 0) {
+			continue;
+		}
+
+		if (operation.type === 'clear') {
+			for (const effects of activeEffects) {
+				removeAtomsFromFdfConstraintEffects(effects, operation.atomIndices);
+			}
+			continue;
+		}
+
+		if (
+			operation.type === 'clear-prev' &&
+			operation.targetConstraintOperationIndex !== undefined
+		) {
+			removeAtomsFromFdfConstraintEffects(
+				activeEffects[operation.targetConstraintOperationIndex],
+				operation.atomIndices
+			);
+		}
+	}
+
+	return activeEffects;
+}
+
+function cloneFdfConstraintEffects(effects: FdfConstraintEffect[]): FdfConstraintEffect[] {
+	return effects.map((effect) => ({
+		...effect,
+		atomIndices: [...effect.atomIndices],
+		...(effect.vector ? { vector: [...effect.vector] as Vec3 } : {})
+	}));
+}
+
+function removeAtomsFromFdfConstraintEffects(
+	effects: FdfConstraintEffect[],
+	atomIndices: number[]
+) {
+	const atomsToRemove = new Set(atomIndices);
+
+	for (const effect of effects) {
+		effect.atomIndices = effect.atomIndices.filter((atomIndex) => !atomsToRemove.has(atomIndex));
+	}
+}
+
+function tokenizeFdfConstraintLine(line: string): string[] {
+	return line
+		.replace(/\[/g, ' [ ')
+		.replace(/\]/g, ' ] ')
+		.split(/\s+/)
+		.filter((token) => token.length > 0);
+}
+
+function parseFdfConstraintSelector(
+	tokens: string[],
+	startIndex: number,
+	atoms: Atom[],
+	speciesAtomicNumbers: Map<number, number>
+): { atomIndices: number[]; nextIndex: number } {
+	const selector = tokens[startIndex].toLowerCase();
+
+	if (selector === 'atom' || selector === 'position') {
+		const parsed = parseFdfConstraintIndexSet(tokens, startIndex + 1, atoms.length, true);
+		return {
+			atomIndices: parsed.indices,
+			nextIndex: parsed.nextIndex
+		};
+	}
+
+	if (selector === 'species-i') {
+		const maxSpeciesIndex = getMaxFdfSpeciesIndex(atoms);
+		const parsed = parseFdfConstraintIndexSet(tokens, startIndex + 1, maxSpeciesIndex, false);
+		const speciesSet = new Set(parsed.indices.map((speciesIndex) => speciesIndex + 1));
+
+		return {
+			atomIndices: atoms
+				.map((atom, atomIndex) => speciesSet.has(atom.fdfSpeciesIndex ?? Number.NaN) ? atomIndex : -1)
+				.filter((atomIndex) => atomIndex >= 0),
+			nextIndex: parsed.nextIndex
+		};
+	}
+
+	if (selector === 'z') {
+		const atomicNumberToken = tokens[startIndex + 1];
+
+		if (!atomicNumberToken || !isIntegerToken(atomicNumberToken)) {
+			throw new Error('Geometry.Constraints Z selector must be followed by an atomic number.');
+		}
+
+		const atomicNumber = parseInt(atomicNumberToken, 10);
+
+		return {
+			atomIndices: atoms
+				.map((atom, atomIndex) => getFdfAtomAtomicNumber(atom, speciesAtomicNumbers) === atomicNumber ? atomIndex : -1)
+				.filter((atomIndex) => atomIndex >= 0),
+			nextIndex: startIndex + 2
+		};
+	}
+
+	if (['center', 'rigid', 'molecule', 'rigid-max', 'molecule-max', 'stress', 'cell-vector', 'cell-angle', 'routine'].includes(selector)) {
+		return {
+			atomIndices: [],
+			nextIndex: tokens.length
+		};
+	}
+
+	throw new Error(`Unsupported Geometry.Constraints selector: ${tokens[startIndex]}`);
+}
+
+function parseFdfConstraintIndexSet(
+	tokens: string[],
+	startIndex: number,
+	maxIndex: number,
+	allowAll: boolean
+): { indices: number[]; nextIndex: number } {
+	if (startIndex >= tokens.length) {
+		throw new Error('Missing Geometry.Constraints atom/species index selector.');
+	}
+
+	if (tokens[startIndex].toLowerCase() === 'all') {
+		if (!allowAll) {
+			throw new Error('Geometry.Constraints selector "all" is only supported for atom/position constraints, not clear, clear-prev, species-i, or Z constraints.');
+		}
+
+		return {
+			indices: Array.from({ length: maxIndex }, (_, index) => index),
+			nextIndex: startIndex + 1
+		};
+	}
+
+	if (tokens[startIndex].toLowerCase() === 'from') {
+		const first = parseInt(tokens[startIndex + 1], 10);
+		const rangeMode = tokens[startIndex + 2]?.toLowerCase();
+		const rangeValue = parseInt(tokens[startIndex + 3], 10);
+		let step = 1;
+		let nextIndex = startIndex + 4;
+
+		if (!Number.isInteger(first) || !Number.isInteger(rangeValue)) {
+			throw new Error('Invalid Geometry.Constraints "from ..." selector.');
+		}
+
+		if (tokens[nextIndex]?.toLowerCase() === 'step') {
+			step = parseInt(tokens[nextIndex + 1], 10);
+			nextIndex += 2;
+		}
+
+		if (rangeMode === 'to') {
+			return {
+				indices: makeOneBasedIndexRange(first, rangeValue, step, maxIndex),
+				nextIndex
+			};
+		}
+
+		if (rangeMode === 'plus') {
+			return {
+				indices: makeOneBasedIndexRange(first, first + rangeValue - 1, step, maxIndex),
+				nextIndex
+			};
+		}
+
+		if (rangeMode === 'minus') {
+			if (first <= rangeValue) {
+				throw new Error('Invalid Geometry.Constraints "from A minus B" selector: A must be greater than B.');
+			}
+			return {
+				indices: makeOneBasedIndexRange(first, first - rangeValue + 1, step, maxIndex),
+				nextIndex
+			};
+		}
+
+		throw new Error('Invalid Geometry.Constraints range selector. Expected "to", "plus", or "minus" after "from A".');
+	}
+
+	if (tokens[startIndex] === '[') {
+		const indices: number[] = [];
+		let index = startIndex + 1;
+
+		while (index < tokens.length && tokens[index] !== ']') {
+			const first = parseInt(tokens[index], 10);
+
+			if (!Number.isInteger(first)) {
+				throw new Error('Invalid Geometry.Constraints bracketed index selector.');
+			}
+
+			if (tokens[index + 1] === '--') {
+				const last = parseInt(tokens[index + 2], 10);
+				let step = 1;
+				index += 3;
+
+				if (tokens[index]?.toLowerCase() === 'step') {
+					step = parseInt(tokens[index + 1], 10);
+					index += 2;
+				}
+
+				indices.push(...makeOneBasedIndexRange(first, last, step, maxIndex));
+			} else {
+				indices.push(oneBasedIndexToZeroBased(first, maxIndex));
+				index += 1;
+			}
+		}
+
+		if (tokens[index] !== ']') {
+			throw new Error('Unclosed Geometry.Constraints bracketed index selector.');
+		}
+
+		return {
+			indices,
+			nextIndex: index + 1
+		};
+	}
+
+	if (isIntegerToken(tokens[startIndex])) {
+		return {
+			indices: [oneBasedIndexToZeroBased(parseInt(tokens[startIndex], 10), maxIndex)],
+			nextIndex: startIndex + 1
+		};
+	}
+
+	throw new Error(`Invalid Geometry.Constraints index selector: ${tokens[startIndex]}`);
+}
+
+function parseFdfConstraintDirection(
+	tokens: string[],
+	startIndex: number
+):
+	| { kind: 'full'; nextIndex: number }
+	| { kind: 'axis'; motionFlags: [boolean, boolean, boolean]; nextIndex: number }
+	| { kind: 'projected'; vector: Vec3; nextIndex: number } {
+	if (
+		startIndex + 2 < tokens.length &&
+		isRealToken(tokens[startIndex]) &&
+		isRealToken(tokens[startIndex + 1]) &&
+		isRealToken(tokens[startIndex + 2])
+	) {
+		const direction: Vec3 = [
+			fdfRealTokenToNumber(tokens[startIndex]),
+			fdfRealTokenToNumber(tokens[startIndex + 1]),
+			fdfRealTokenToNumber(tokens[startIndex + 2])
+		];
+
+		return directionVectorToConstraint(direction, startIndex + 3);
+	}
+
+	return {
+		kind: 'full',
+		nextIndex: startIndex
+	};
+}
+
+function directionVectorToConstraint(
+	direction: Vec3,
+	nextIndex: number
+):
+	| { kind: 'axis'; motionFlags: [boolean, boolean, boolean]; nextIndex: number }
+	| { kind: 'projected'; vector: Vec3; nextIndex: number } {
+	if (direction.every((value) => Math.abs(value) < 1e-12)) {
+		throw new Error('Geometry.Constraints directional vector cannot be zero.');
+	}
+
+	const nonzeroComponents = direction.map((value) => Math.abs(value) >= 1e-12);
+	const nonzeroCount = nonzeroComponents.filter(Boolean).length;
+
+	if (nonzeroCount === 1) {
+		return {
+			kind: 'axis',
+			motionFlags: [
+				!nonzeroComponents[0],
+				!nonzeroComponents[1],
+				!nonzeroComponents[2]
+			],
+			nextIndex
+		};
+	}
+
+	return {
+		kind: 'projected',
+		vector: direction,
+		nextIndex
+	};
+}
+
+function makeOneBasedIndexRange(first: number, last: number, step: number, maxIndex: number): number[] {
+	if (!Number.isInteger(step) || step <= 0) {
+		throw new Error('Geometry.Constraints step must be a positive integer.');
+	}
+
+	const indices: number[] = [];
+	const direction = first <= last ? 1 : -1;
+	const signedStep = direction * step;
+
+	for (
+		let value = first;
+		direction > 0 ? value <= last : value >= last;
+		value += signedStep
+	) {
+		indices.push(oneBasedIndexToZeroBased(value, maxIndex));
+	}
+
+	return indices;
+}
+
+function oneBasedIndexToZeroBased(index: number, maxIndex: number): number {
+	if (!Number.isInteger(index) || index < 1 || index > maxIndex) {
+		throw new Error(`Geometry.Constraints index ${index} is out of range.`);
+	}
+
+	return index - 1;
+}
+
+function getMaxFdfSpeciesIndex(atoms: Atom[]): number {
+	return atoms.reduce((maxSpeciesIndex, atom) => {
+		return atom.fdfSpeciesIndex !== undefined
+			? Math.max(maxSpeciesIndex, atom.fdfSpeciesIndex)
+			: maxSpeciesIndex;
+	}, 0);
+}
+
+function getFdfAtomAtomicNumber(atom: Atom, speciesAtomicNumbers: Map<number, number>): number | undefined {
+	if (atom.fdfSpeciesIndex !== undefined) {
+		const atomicNumber = speciesAtomicNumbers.get(atom.fdfSpeciesIndex);
+
+		if (atomicNumber !== undefined) {
+			return atomicNumber;
+		}
+	}
+
+	return elementSymbolToAtomicNumber(atom.element);
+}
+
+function elementSymbolToAtomicNumber(element: string): number | undefined {
+	const normalized = normalizeElementSymbol(element);
+	const atomicNumber = ELEMENT_SYMBOLS_BY_ATOMIC_NUMBER.indexOf(normalized);
+	return atomicNumber > 0 ? atomicNumber : undefined;
+}
+
+function fdfRealTokenToNumber(token: string): number {
+	return Number(token.replace(/[Dd]/, 'E'));
+}
+
+function isIntegerToken(token: string): boolean {
+	return /^[-+]?\d+$/.test(token);
+}
+
+function isRealToken(token: string): boolean {
+	return /^[-+]?(?:\d+\.\d*|\.\d+)(?:[EeDd][-+]?\d+)?$/.test(token);
 }
 
 function findFdfLine(lines: FdfLine[], key: string): FdfLine | undefined {
@@ -1223,10 +1764,14 @@ function parseGaussianCartesianAtomLine(line: string): Atom | undefined {
 	}
 
 	let coordinateStartIndex = 1;
-	const freezeCode = parseGaussianFreezeCode(tokens[coordinateStartIndex]);
+	let freezeCode: number | undefined;
 
-	if (freezeCode !== undefined) {
-		coordinateStartIndex += 1;
+	if (tokens.length >= 5) {
+		freezeCode = parseGaussianFreezeCode(tokens[coordinateStartIndex]);
+
+		if (freezeCode !== undefined) {
+			coordinateStartIndex += 1;
+		}
 	}
 
 	const coordinateTokens = tokens.slice(coordinateStartIndex, coordinateStartIndex + 3);
@@ -1623,6 +2168,10 @@ function parseQeHeaderUnit(header: string): string | undefined {
 
 function parseQeCoordinateFormat(unit: string): QeCoordinateFormat {
 	const normalized = unit.toLowerCase();
+
+	if (normalized.startsWith('crystal_sg')) {
+		throw new Error('ATOMIC_POSITIONS crystal_sg is not supported. AtomView requires all atoms to be explicitly listed.');
+	}
 
 	if (normalized.startsWith('crystal')) {
 		return 'Crystal';

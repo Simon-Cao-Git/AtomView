@@ -1,7 +1,8 @@
 {
 	"name": "atomview",
+	"displayName": "AtomView",
 	"description": "Lightweight live atomic structure preview inside VS Code",
-	"version": "0.3.0",
+	"version": "0.3.1",
 	"publisher": "PurunSimonCao",
 	"private": false,
 	"repository": {
@@ -14,8 +15,15 @@
 	},
 	"icon": "media/icon.png",
 	"categories": [
-		"Other"
+		"Visualization"
 	],
+	"keywords": [
+		"POSCAR",
+		"VASP",
+		"Gaussian",
+		"SIESTA",
+		"Quantum ESPRESSO"
+    ],
 	"activationEvents": [
 		"onCommand:atomview.openPreview"
 	],

@@ -1,0 +1,8 @@
+media/DEMO.gif
+tests/
+node_modules/three/**
+!node_modules/three/package.json
+!node_modules/three/build/three.module.js
+!node_modules/three/build/three.core.js
+!node_modules/three/examples/jsm/controls/TrackballControls.js
+!node_modules/three/LICENSE

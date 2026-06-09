@@ -27,7 +27,8 @@ let frameSliderContainer;
 let frameSlider;
 let frameLabel;
 let playPauseButton;
-let playbackTimer;
+let playbackLastTimestamp;
+let playbackAccumulatorMs = 0;
 let isPlayingTrajectory = false;
 
 const BALL_RADIUS_SCALE = 0.4;
@@ -271,8 +272,9 @@ function createTrackballControls() {
 	return trackballControls;
 }
 
-function animate() {
+function animate(timestamp) {
 	requestAnimationFrame(animate);
+	updateTrajectoryPlayback(timestamp);
 	controls.update();
 	renderer.render(scene, camera);
 	renderAxisViewer();
@@ -470,6 +472,7 @@ function getCurrentFrameStructure() {
 
 	return {
 		...latestStructure,
+		...(frame.lattice ? { lattice: frame.lattice } : {}),
 		atoms: frame.atoms,
 		coordinateMode: frame.coordinateMode
 	};
@@ -500,6 +503,11 @@ function tryUpdateAtomPositionsOnly(structure) {
 		return false;
 	}
 
+	const nextLatticeSignature = getLatticeSignature(structure.lattice);
+	if (nextLatticeSignature !== currentLatticeSignature) {
+		return false;
+	}
+
 	for (let index = 0; index < structure.atoms.length; index++) {
 		const atom = structure.atoms[index];
 		const mesh = atomMeshes[index];
@@ -517,6 +525,7 @@ function tryUpdateAtomPositionsOnly(structure) {
 		mesh.userData.atom = atom;
 		mesh.userData.atomIndex = index;
 		mesh.userData.frameIndex = currentFrameIndex;
+		updateAtomMeshAppearance(mesh, atom);
 	}
 
 	updateBondsForCurrentFrame(structure);
@@ -573,6 +582,7 @@ function updateFrameLabel() {
 
 	const frame = latestStructure?.frames?.[currentFrameIndex];
 	const displayIndex = frame?.index ?? currentFrameIndex + 1;
+
 	frameLabel.textContent = `Frame ${displayIndex} / ${frameCount}`;
 }
 
@@ -591,15 +601,9 @@ function startTrajectoryPlayback() {
 	}
 
 	isPlayingTrajectory = true;
+	playbackLastTimestamp = undefined;
+	playbackAccumulatorMs = 0;
 	updatePlayPauseButton();
-
-	if (playbackTimer) {
-		clearInterval(playbackTimer);
-	}
-
-	playbackTimer = setInterval(() => {
-		advanceTrajectoryFrame();
-	}, getPlaybackIntervalMs());
 }
 
 function getPlaybackIntervalMs() {
@@ -622,11 +626,49 @@ function getPlaybackIntervalMs() {
 
 function stopTrajectoryPlayback() {
 	isPlayingTrajectory = false;
+	playbackLastTimestamp = undefined;
+	playbackAccumulatorMs = 0;
 	updatePlayPauseButton();
+}
 
-	if (playbackTimer) {
-		clearInterval(playbackTimer);
-		playbackTimer = undefined;
+function updateTrajectoryPlayback(timestamp) {
+	if (!isPlayingTrajectory) {
+		return;
+	}
+
+	if (!hasTrajectoryFrames()) {
+		stopTrajectoryPlayback();
+		return;
+	}
+
+	if (playbackLastTimestamp === undefined) {
+		playbackLastTimestamp = timestamp;
+		return;
+	}
+
+	const elapsedMs = timestamp - playbackLastTimestamp;
+	playbackLastTimestamp = timestamp;
+
+	if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) {
+		return;
+	}
+
+	playbackAccumulatorMs += elapsedMs;
+	const intervalMs = getPlaybackIntervalMs();
+	const maxFramesPerAnimationTick = 4;
+	let advancedFrames = 0;
+
+	while (
+		playbackAccumulatorMs >= intervalMs &&
+		advancedFrames < maxFramesPerAnimationTick
+	) {
+		advanceTrajectoryFrame();
+		playbackAccumulatorMs -= intervalMs;
+		advancedFrames += 1;
+	}
+
+	if (advancedFrames === maxFramesPerAnimationTick) {
+		playbackAccumulatorMs = 0;
 	}
 }
 
@@ -795,6 +837,24 @@ function drawAtoms(structure, group) {
 	}
 }
 
+function updateAtomMeshAppearance(mesh, atom) {
+	const element = getElementData(atom.element);
+	const isConstrained = isAtomConstrained(atom);
+	const atomColor = isConstrained
+		? makePalerColor(element.color)
+		: element.color;
+
+	if (mesh.material) {
+		mesh.material.color.copy(atomColor);
+		mesh.material.transparent = isConstrained;
+		mesh.material.opacity = isConstrained ? 0.55 : 1.0;
+		mesh.material.needsUpdate = true;
+	}
+
+	mesh.userData.originalColor = atomColor.clone();
+	mesh.userData.isConstrained = isConstrained;
+}
+
 function handlePointerMove(event) {
 	if (!camera || !raycaster || atomMeshes.length === 0) {
 		return;
@@ -822,7 +882,7 @@ function handlePointerMove(event) {
 	mesh.scale.setScalar(1.18);
 	mesh.material.emissive = new THREE.Color(0x333333);
 
-	showAtomHoverInfo(atom, atomIndex, currentFrameIndex, frameStructure?.coordinateMode);
+	showAtomHoverInfo(atom, atomIndex, currentFrameIndex, frameStructure?.coordinateMode, frameStructure?.sourceFormat);
 }
 
 function resetAtomHoverAppearance() {
@@ -842,7 +902,7 @@ function clearHoverInfo() {
 	}
 }
 
-function showAtomHoverInfo(atom, atomIndex, frameIndex, coordinateMode) {
+function showAtomHoverInfo(atom, atomIndex, frameIndex, coordinateMode, sourceFormat) {
 	const lines = [
 		`Atom ${atomIndex + 1}: ${atom.element}`
 	];
@@ -859,15 +919,51 @@ function showAtomHoverInfo(atom, atomIndex, frameIndex, coordinateMode) {
 
 	lines.push(`Cartesian: ${formatVector(atom.position)}`);
 
+	const constrainedDirections = [];
+
 	if (Array.isArray(atom.selectiveDynamics)) {
-		const flags = atom.selectiveDynamics
-			.map((canMove) => canMove ? 'Free' : 'Fixed')
-			.join(' ');
-		lines.push(`Movement: ${flags}`);
+		const axisLabels = getConstraintAxisLabels(sourceFormat);
+
+		if (!atom.selectiveDynamics[0]) {
+			constrainedDirections.push(axisLabels[0]);
+		}
+		if (!atom.selectiveDynamics[1]) {
+			constrainedDirections.push(axisLabels[1]);
+		}
+		if (!atom.selectiveDynamics[2]) {
+			constrainedDirections.push(axisLabels[2]);
+		}
+	}
+
+	if (constrainedDirections.length > 0) {
+		lines.push(`Constrained along: ${constrainedDirections.join(', ')}`);
+	}
+
+	if (Array.isArray(atom.projectedForceConstraints)) {
+		for (const vector of atom.projectedForceConstraints) {
+			if (Array.isArray(vector) && vector.length >= 3) {
+				lines.push(`Constrained along vector: ${formatVector(vector.slice(0, 3))}`);
+			}
+		}
 	}
 
 	hoverElement.textContent = lines.join('\n');
 	hoverElement.style.display = 'block';
+}
+
+function getConstraintAxisLabels(sourceFormat) {
+	const normalizedFormat = String(sourceFormat ?? '').toUpperCase();
+
+	if (
+		normalizedFormat === 'VASP' ||
+		normalizedFormat === 'POSCAR' ||
+		normalizedFormat === 'CONTCAR' ||
+		normalizedFormat === 'XDATCAR'
+	) {
+		return ['a', 'b', 'c'];
+	}
+
+	return ['x', 'y', 'z'];
 }
 
 function formatVector(vector) {
@@ -875,8 +971,12 @@ function formatVector(vector) {
 }
 
 function isAtomConstrained(atom) {
-	return Array.isArray(atom.selectiveDynamics) &&
+	const hasAxisConstraint = Array.isArray(atom.selectiveDynamics) &&
 		atom.selectiveDynamics.some((canMove) => !canMove);
+	const hasProjectedConstraint = Array.isArray(atom.projectedForceConstraints) &&
+		atom.projectedForceConstraints.length > 0;
+
+	return hasAxisConstraint || hasProjectedConstraint;
 }
 
 function makePalerColor(color) {
