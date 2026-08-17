@@ -60,6 +60,9 @@ Install directly from the VS Marketplace:
 
 ## Release Notes
 
+### 0.3.2
+- Minor fix for SIESTA parser
+
 ### 0.3.1
 - Added support for SIESTA `Geometry.Constraints` coordinate constraints
 

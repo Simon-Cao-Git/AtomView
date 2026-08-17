@@ -933,23 +933,26 @@ function parseFdfCoordinateFormat(lines: FdfLine[]): FdfCoordinateFormat {
 	const line = findFdfLine(lines, 'AtomicCoordinatesFormat');
 	const value = line?.clean.split(/\s+/)[1]?.toLowerCase() ?? 'bohr';
 
-	if (value.startsWith('frac') || value.startsWith('crystal')) {
-		return 'Fractional';
-	}
+	switch (value) {
+		case 'bohr':
+		case 'notscaledcartesianbohr':
+			return 'CartesianBohr';
 
-	if (value.startsWith('scaled')) {
-		return 'ScaledCartesian';
-	}
+		case 'ang':
+		case 'notscaledcartesianang':
+			return 'CartesianAngstrom';
 
-	if (value.startsWith('ang')) {
-		return 'CartesianAngstrom';
-	}
+		case 'latticeconstant':
+		case 'scaledcartesian':
+			return 'ScaledCartesian';
 
-	if (value.startsWith('bohr')) {
-		return 'CartesianBohr';
-	}
+		case 'fractional':
+		case 'scaledbylatticevectors':
+			return 'Fractional';
 
-	throw new Error(`Unsupported AtomicCoordinatesFormat: ${value}`);
+		default:
+			throw new Error(`Unsupported AtomicCoordinatesFormat: ${value}`);
+	}
 }
 
 function parseFdfAtoms(
