@@ -65,14 +65,11 @@ Install directly from the VS Marketplace:
 
 ## Release Notes
 
-### 0.3.3 (unreleased)
-- Added independent previews for different files, each remaining attached to its source
-- Preserved per-frame lattices in stacked VASP trajectories and corrected VASP scaling-factor handling
-- Corrected Quantum ESPRESSO lattice scaling and inline namelist parsing
-- Corrected SIESTA label matching, element identification, atom-index lists, and `clear-prev` handling around non-atom constraints
-- Added a persistent warning for partially parsed Gaussian structures
-- Disposed replaced lattice-axis graphics and label textures
-- Added focused parser and rendering regression checks (`npm test`)
+### 0.3.3
+- Added support for multiple independent preview windows
+- Improved viewer performance
+- Improved loading and playback of long trajectories
+- Fixed various minor parsing issues
 
 ### 0.3.2
 - Minor fix for SIESTA parser

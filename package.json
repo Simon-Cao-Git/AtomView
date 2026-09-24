@@ -2,7 +2,7 @@
 	"name": "atomview",
 	"displayName": "AtomView",
 	"description": "Lightweight live atomic structure preview inside VS Code",
-	"version": "0.3.2",
+	"version": "0.3.3",
 	"publisher": "PurunSimonCao",
 	"private": false,
 	"repository": {
@@ -48,7 +48,6 @@
 	},
 	"scripts": {
 		"vscode:prepublish": "npm run compile",
-		"test": "node --test test/*.test.cjs",
 		"compile": "tsc -p ./",
 		"watch": "tsc -w -p ./"
 	},

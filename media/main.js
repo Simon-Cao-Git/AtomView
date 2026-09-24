@@ -30,6 +30,13 @@ let playPauseButton;
 let playbackLastTimestamp;
 let playbackAccumulatorMs = 0;
 let isPlayingTrajectory = false;
+const vscode = acquireVsCodeApi();
+let trajectoryId = 0;
+let trajectoryFrameCount = 1;
+let currentFrameNumber = 1;
+let desiredFrameIndex = 0;
+let pendingFrameRequest;
+let nextFrameRequestId = 0;
 
 const BALL_RADIUS_SCALE = 0.4;
 const BOND_RADIUS = 0.06;
@@ -55,24 +62,54 @@ window.addEventListener('message', (event) => {
 
 	if (message.command === 'showStructure') {
 		const hadStructure = Boolean(latestStructure);
-		const previousFrameIndex = currentFrameIndex;
 		latestStructure = message.structure;
-
-		if (!hadStructure) {
-			currentFrameIndex = 0;
-		} else {
-			const frameCount = Array.isArray(latestStructure.frames)
-				? latestStructure.frames.length
-				: 1;
-			currentFrameIndex = Math.min(previousFrameIndex, Math.max(frameCount - 1, 0));
-		}
+		trajectoryId = message.trajectoryId;
+		trajectoryFrameCount = message.frameCount;
+		currentFrameIndex = message.frameIndex;
+		currentFrameNumber = message.frameNumber;
+		desiredFrameIndex = currentFrameIndex;
+		pendingFrameRequest = undefined;
+		playbackLastTimestamp = undefined;
+		playbackAccumulatorMs = 0;
 
 		showStatus(latestStructure.warning ?? '');
 		updateFrameSlider();
 		// The current frame's lattice determines whether atom meshes can be reused.
 		renderCurrentFrame({ preserveCamera: hadStructure });
+		return;
+	}
+
+	if (
+		message.command === 'showFrame' &&
+		message.trajectoryId === trajectoryId &&
+		message.requestId === pendingFrameRequest?.requestId
+	) {
+		pendingFrameRequest = undefined;
+		if (message.frameIndex !== desiredFrameIndex) {
+			requestTrajectoryFrame(desiredFrameIndex);
+			return;
+		}
+		latestStructure = message.structure;
+		currentFrameIndex = message.frameIndex;
+		currentFrameNumber = message.frameNumber;
+		frameSlider.value = String(currentFrameIndex);
+		renderCurrentFrame({ preserveCamera: true });
 	}
 });
+vscode.postMessage({ command: 'ready' });
+
+function requestTrajectoryFrame(index) {
+	desiredFrameIndex = Math.max(0, Math.min(index, trajectoryFrameCount - 1));
+	if (pendingFrameRequest) {
+		return;
+	}
+	pendingFrameRequest = { requestId: ++nextFrameRequestId };
+	vscode.postMessage({
+		command: 'requestFrame', trajectoryId,
+		requestId: pendingFrameRequest.requestId,
+		frameIndex: desiredFrameIndex
+	});
+}
 
 // loadBondRules removed: now using embedded BONDS_DATA.
 
@@ -215,9 +252,7 @@ function initViewer() {
 	frameSlider.value = '0';
 	frameSlider.style.width = '140px';
 	frameSlider.addEventListener('input', () => {
-		currentFrameIndex = Number(frameSlider.value);
-		updateFrameLabel();
-		renderCurrentFrame({ preserveCamera: true });
+		requestTrajectoryFrame(Number(frameSlider.value));
 	});
 	frameSliderContainer.appendChild(frameSlider);
 
@@ -454,28 +489,11 @@ function toggleCameraProjection() {
 	}
 }
 function hasTrajectoryFrames() {
-	return latestStructure &&
-		Array.isArray(latestStructure.frames) &&
-		latestStructure.frames.length > 1;
+	return latestStructure && trajectoryFrameCount > 1;
 }
 
 function getCurrentFrameStructure() {
-	if (!latestStructure) {
-		return undefined;
-	}
-
-	if (!Array.isArray(latestStructure.frames) || latestStructure.frames.length === 0) {
-		return latestStructure;
-	}
-
-	const frame = latestStructure.frames[currentFrameIndex] ?? latestStructure.frames[0];
-
-	return {
-		...latestStructure,
-		...(frame.lattice ? { lattice: frame.lattice } : {}),
-		atoms: frame.atoms,
-		coordinateMode: frame.coordinateMode
-	};
+	return latestStructure;
 }
 
 function renderCurrentFrame(options = {}) {
@@ -562,7 +580,7 @@ function updateFrameSlider() {
 		return;
 	}
 
-	const frameCount = latestStructure.frames.length;
+	const frameCount = trajectoryFrameCount;
 	currentFrameIndex = Math.min(Math.max(currentFrameIndex, 0), frameCount - 1);
 	frameSlider.min = '0';
 	frameSlider.max = String(frameCount - 1);
@@ -576,14 +594,7 @@ function updateFrameLabel() {
 		return;
 	}
 
-	const frameCount = Array.isArray(latestStructure?.frames)
-		? latestStructure.frames.length
-		: 1;
-
-	const frame = latestStructure?.frames?.[currentFrameIndex];
-	const displayIndex = frame?.index ?? currentFrameIndex + 1;
-
-	frameLabel.textContent = `Frame ${displayIndex} / ${frameCount}`;
+	frameLabel.textContent = `Frame ${currentFrameNumber} / ${trajectoryFrameCount}`;
 }
 
 function toggleTrajectoryPlayback() {
@@ -607,9 +618,7 @@ function startTrajectoryPlayback() {
 }
 
 function getPlaybackIntervalMs() {
-	const frameCount = Array.isArray(latestStructure?.frames)
-		? latestStructure.frames.length
-		: 1;
+	const frameCount = trajectoryFrameCount;
 
 	if (frameCount <= 1) {
 		return SLOWEST_PLAYBACK_INTERVAL_MS;
@@ -645,6 +654,12 @@ function updateTrajectoryPlayback(timestamp) {
 		playbackLastTimestamp = timestamp;
 		return;
 	}
+	if (pendingFrameRequest) {
+		// Wait for delivery instead of accumulating a backlog of frame requests.
+		playbackLastTimestamp = timestamp;
+		playbackAccumulatorMs = 0;
+		return;
+	}
 
 	const elapsedMs = timestamp - playbackLastTimestamp;
 	playbackLastTimestamp = timestamp;
@@ -660,7 +675,8 @@ function updateTrajectoryPlayback(timestamp) {
 
 	while (
 		playbackAccumulatorMs >= intervalMs &&
-		advancedFrames < maxFramesPerAnimationTick
+		advancedFrames < maxFramesPerAnimationTick &&
+		!pendingFrameRequest
 	) {
 		advanceTrajectoryFrame();
 		playbackAccumulatorMs -= intervalMs;
@@ -678,11 +694,7 @@ function advanceTrajectoryFrame() {
 		return;
 	}
 
-	const frameCount = latestStructure.frames.length;
-	currentFrameIndex = (currentFrameIndex + 1) % frameCount;
-	frameSlider.value = String(currentFrameIndex);
-	updateFrameLabel();
-	renderCurrentFrame({ preserveCamera: true });
+	requestTrajectoryFrame((currentFrameIndex + 1) % trajectoryFrameCount);
 }
 
 function updatePlayPauseButton() {
@@ -908,9 +920,7 @@ function showAtomHoverInfo(atom, atomIndex, frameIndex, coordinateMode, sourceFo
 	];
 
 	if (hasTrajectoryFrames()) {
-		const frame = latestStructure?.frames?.[frameIndex];
-		const displayIndex = frame?.index ?? frameIndex + 1;
-		lines.splice(1, 0, `Frame: ${displayIndex}`);
+		lines.splice(1, 0, `Frame: ${currentFrameNumber}`);
 	}
 
 	if (coordinateMode === 'Direct' && atom.fractionalPosition) {

@@ -95,6 +95,12 @@ class AtomViewPanel {
 	private readonly panel: vscode.WebviewPanel;
 	private readonly extensionUri: vscode.Uri;
 	private disposables: vscode.Disposable[] = [];
+	private structure: AtomicStructure | undefined;
+	private trajectoryId = 0;
+	private frameIndex = 0;
+	private loadId = 0;
+	private ready = false;
+	private disposed = false;
 
 	public static createOrShow(extensionUri: vscode.Uri, sourceUri?: vscode.Uri) {
 		// Capture the source before creating a webview changes the active editor.
@@ -126,8 +132,23 @@ class AtomViewPanel {
 		this.extensionUri = extensionUri;
 		this.sourceDocumentUri = sourceUri;
 
+		this.panel.webview.onDidReceiveMessage((message) => {
+			if (message.command === 'ready') {
+				this.ready = true;
+				this.updateFromSourceDocument();
+			} else if (
+				message.command === 'requestFrame' &&
+				message.trajectoryId === this.trajectoryId &&
+				Number.isInteger(message.frameIndex) &&
+				message.frameIndex >= 0 &&
+				message.frameIndex < (this.structure?.frames?.length ?? 0) &&
+				Number.isInteger(message.requestId)
+			) {
+				this.frameIndex = message.frameIndex;
+				this.sendFrame('showFrame', message.requestId);
+			}
+		}, null, this.disposables);
 		this.panel.webview.html = this.getHtmlForWebview(this.panel.webview);
-		this.updateFromSourceDocument();
 
 		this.panel.onDidDispose(
 			() => this.dispose(),
@@ -160,48 +181,89 @@ class AtomViewPanel {
 	}
 
 	private async updateFromSourceDocument() {
-		const document = this.sourceDocumentUri
-			? await vscode.workspace.openTextDocument(this.sourceDocumentUri)
-			: undefined;
-
-		if (!document) {
-			this.postStatus(
-				'Open a POSCAR, CONTCAR, XDATCAR, .vasp, .fdf, .gjf, or .in file to preview it.'
-			);
+		if (!this.ready || this.disposed) {
+			return;
+		}
+		const uri = this.sourceDocumentUri;
+		if (!uri) {
+			this.postStatus('Open a POSCAR, CONTCAR, XDATCAR, .vasp, .fdf, .gjf, or .in file to preview it.');
 			return;
 		}
 
-		this.updateFromDocument(document);
+		const loadId = ++this.loadId;
+		try {
+			let text: string;
+			try {
+				// Prefer the document so ordinary files include unsaved edits.
+				const document = await vscode.workspace.openTextDocument(uri);
+				text = document.getText();
+			} catch (error) {
+				// VS Code can display large files without exposing them to extensions
+				// as TextDocuments. Read their saved contents through the URI provider.
+				const stat = await vscode.workspace.fs.stat(uri);
+				if (stat.size <= 50 * 1024 * 1024) {
+					throw error;
+				}
+				const bytes = await vscode.workspace.fs.readFile(uri);
+				text = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('utf8');
+			}
+			if (!this.disposed && loadId === this.loadId) {
+				this.updateFromText(uri.path, text);
+			}
+		} catch (error) {
+			if (!this.disposed && loadId === this.loadId) {
+				this.postStatus(`Failed to load structure: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
 	}
 
 	private updateFromDocument(document: vscode.TextDocument) {
-		const fileName = document.fileName.split(/[\\/]/).pop() ?? '';
-		const text = document.getText();
-		const detectedFormat = detectFormat(fileName, text);
+		++this.loadId;
+		if (this.ready && !this.disposed) {
+			this.updateFromText(document.fileName, document.getText());
+		}
+	}
 
+	private updateFromText(sourceName: string, text: string) {
+		const fileName = sourceName.split(/[\\/]/).pop() ?? '';
+		const detectedFormat = detectFormat(fileName, text);
 		if (!detectedFormat) {
-			this.postStatus(
-				`Source file is ${fileName}. Open a supported atomistic structure/input file to preview it.`
-			);
+			this.postStatus(`Source file is ${fileName}. Open a supported atomistic structure/input file to preview it.`);
 			return;
 		}
 
 		try {
-			const structure = parseStructureFile(text, detectedFormat);
+			this.structure = parseStructureFile(text, detectedFormat);
+			++this.trajectoryId;
+			this.frameIndex = Math.min(this.frameIndex, (this.structure.frames?.length ?? 1) - 1);
 			this.panel.title = `AtomView: ${fileName}`;
-
-			this.panel.webview.postMessage({
-				command: 'showStructure',
-				structure
-			});
+			this.sendFrame('showStructure');
 		} catch (error) {
-			const message =
-				error instanceof Error
-					? error.message
-					: String(error);
-
-			this.postStatus(`Failed to parse ${fileName}: ${message}`);
+			this.postStatus(`Failed to parse ${fileName}: ${error instanceof Error ? error.message : String(error)}`);
 		}
+	}
+
+	private sendFrame(command: 'showStructure' | 'showFrame', requestId?: number) {
+		if (!this.structure || this.disposed) {
+			return;
+		}
+		// Never include the full trajectory in a webview message.
+		const { frames, ...base } = this.structure;
+		const frame = frames?.[this.frameIndex];
+		this.panel.webview.postMessage({
+			command,
+			trajectoryId: this.trajectoryId,
+			requestId,
+			frameCount: frames?.length ?? 1,
+			frameIndex: this.frameIndex,
+			frameNumber: frame?.index ?? 1,
+			structure: frame ? {
+				...base,
+				lattice: frame.lattice ?? base.lattice,
+				atoms: frame.atoms,
+				coordinateMode: frame.coordinateMode
+			} : base
+		});
 	}
 
 	private postStatus(text: string) {
@@ -212,6 +274,9 @@ class AtomViewPanel {
 	}
 
 	private dispose() {
+		this.disposed = true;
+		++this.loadId;
+		this.structure = undefined;
 		AtomViewPanel.panels.delete(this.sourceDocumentUri?.toString());
 
 		while (this.disposables.length) {
