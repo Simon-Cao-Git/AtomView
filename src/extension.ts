@@ -24,6 +24,7 @@ interface Atom {
 
 interface TrajectoryFrame {
 	index: number;
+	lattice?: [Vec3, Vec3, Vec3];
 	atoms: Atom[];
 	coordinateMode: 'Direct' | 'Cartesian';
 }
@@ -35,6 +36,7 @@ interface AtomicStructure {
 	coordinateMode: 'Direct' | 'Cartesian';
 	sourceFormat: SourceFormat;
 	frames?: TrajectoryFrame[];
+	warning?: string;
 }
 
 interface ParsedPoscarBlock {
@@ -86,41 +88,43 @@ function getWebviewOptions(extensionUri: vscode.Uri): vscode.WebviewOptions {
 }
 
 class AtomViewPanel {
-	public static currentPanel: AtomViewPanel | undefined;
+	private static readonly panels = new Map<string | undefined, AtomViewPanel>();
 	public static readonly viewType = 'atomview.preview';
 
-	private sourceDocumentUri: vscode.Uri | undefined;
+	private readonly sourceDocumentUri: vscode.Uri | undefined;
 	private readonly panel: vscode.WebviewPanel;
 	private readonly extensionUri: vscode.Uri;
 	private disposables: vscode.Disposable[] = [];
 
 	public static createOrShow(extensionUri: vscode.Uri, sourceUri?: vscode.Uri) {
-		const column = vscode.ViewColumn.Beside;
+		// Capture the source before creating a webview changes the active editor.
+		const documentUri = sourceUri ?? vscode.window.activeTextEditor?.document.uri;
+		const sourceKey = documentUri?.toString();
+		const existingPanel = AtomViewPanel.panels.get(sourceKey);
 
-		if (AtomViewPanel.currentPanel) {
-			AtomViewPanel.currentPanel.panel.reveal(column);
-			AtomViewPanel.currentPanel.updateFromSourceDocument();
+		if (existingPanel) {
+			existingPanel.panel.reveal();
+			existingPanel.updateFromSourceDocument();
 			return;
 		}
 
 		const panel = vscode.window.createWebviewPanel(
 			AtomViewPanel.viewType,
 			'AtomView',
-			column,
+			vscode.ViewColumn.Beside,
 			{
 				...getWebviewOptions(extensionUri),
 				retainContextWhenHidden: true
 			}
 		);
 
-		AtomViewPanel.currentPanel = new AtomViewPanel(panel, extensionUri, sourceUri);
+		AtomViewPanel.panels.set(sourceKey, new AtomViewPanel(panel, extensionUri, documentUri));
 	}
 
 	private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, sourceUri?: vscode.Uri) {
 		this.panel = panel;
 		this.extensionUri = extensionUri;
-		this.sourceDocumentUri =
-			sourceUri ?? vscode.window.activeTextEditor?.document.uri;
+		this.sourceDocumentUri = sourceUri;
 
 		this.panel.webview.html = this.getHtmlForWebview(this.panel.webview);
 		this.updateFromSourceDocument();
@@ -208,7 +212,7 @@ class AtomViewPanel {
 	}
 
 	private dispose() {
-		AtomViewPanel.currentPanel = undefined;
+		AtomViewPanel.panels.delete(this.sourceDocumentUri?.toString());
 
 		while (this.disposables.length) {
 			this.disposables.pop()?.dispose();
@@ -392,6 +396,7 @@ function parseVaspStructureFile(
 
 	const frames: TrajectoryFrame[] = structures.map((structure, index) => ({
 		index: index + 1,
+		lattice: structure.lattice,
 		atoms: structure.atoms,
 		coordinateMode: structure.coordinateMode
 	}));
@@ -403,6 +408,45 @@ function parseVaspStructureFile(
 		coordinateMode: frames[0].coordinateMode,
 		frames
 	};
+}
+
+// VASP scaling is either one multiplier, a negative target volume, or three
+// positive Cartesian component multipliers (not one multiplier per lattice vector).
+function parseVaspScale(line: string, lattice: [Vec3, Vec3, Vec3]): Vec3 {
+	const values = line.split(/[!#]/)[0].trim().split(/\s+/).map(Number);
+	if (
+		(values.length !== 1 && values.length !== 3) ||
+		values.some((value) => !Number.isFinite(value))
+	) {
+		throw new Error('VASP scaling line must contain one or three numbers.');
+	}
+
+	if (values.length === 3) {
+		if (values.some((value) => value <= 0)) {
+			throw new Error('The three VASP scaling factors must be positive.');
+		}
+		return values as Vec3;
+	}
+
+	let scale = values[0];
+	if (scale < 0) {
+		const [a, b, c] = lattice;
+		const volume = Math.abs(
+			a[0] * (b[1] * c[2] - b[2] * c[1]) -
+			a[1] * (b[0] * c[2] - b[2] * c[0]) +
+			a[2] * (b[0] * c[1] - b[1] * c[0])
+		);
+		scale = Math.cbrt(-scale / volume);
+		if (!Number.isFinite(scale)) {
+			throw new Error('Cannot apply a VASP target volume to this lattice.');
+		}
+	}
+
+	return [scale, scale, scale];
+}
+
+function scaleVaspVector(vector: Vec3, scale: Vec3): Vec3 {
+	return [vector[0] * scale[0], vector[1] * scale[1], vector[2] * scale[2]];
 }
 
 function looksLikeXdatcar(lines: string[]): boolean {
@@ -418,20 +462,15 @@ function parseXdatcar(
 	}
 
 	const title = lines[0];
-	const scale = parseFloat(lines[1]);
-
-	if (!Number.isFinite(scale)) {
-		throw new Error('Invalid XDATCAR scaling factor.');
-	}
-
 	const rawLattice = [
 		parseVector(lines[2]),
 		parseVector(lines[3]),
 		parseVector(lines[4])
 	] as [Vec3, Vec3, Vec3];
 
+	const scale = parseVaspScale(lines[1], rawLattice);
 	const lattice = rawLattice.map((vector) =>
-		scaleVector(vector, scale)
+		scaleVaspVector(vector, scale)
 	) as [Vec3, Vec3, Vec3];
 
 	const elementSymbols = lines[5].split(/\s+/);
@@ -607,20 +646,15 @@ function parseSinglePoscarBlock(
 	}
 
 	const title = lines[0];
-	const scale = parseFloat(lines[1]);
-
-	if (!Number.isFinite(scale)) {
-		throw new Error('Invalid scaling factor.');
-	}
-
 	const rawLattice = [
 		parseVector(lines[2]),
 		parseVector(lines[3]),
 		parseVector(lines[4])
 	] as [Vec3, Vec3, Vec3];
 
+	const scale = parseVaspScale(lines[1], rawLattice);
 	const lattice = rawLattice.map((vector) =>
-		scaleVector(vector, scale)
+		scaleVaspVector(vector, scale)
 	) as [Vec3, Vec3, Vec3];
 
 	const elementSymbols = lines[5].split(/\s+/);
@@ -676,7 +710,7 @@ function parseSinglePoscarBlock(
 			atoms.push({
 				element,
 				selectiveDynamics,
-				position: scaleVector(rawPosition, scale)
+				position: scaleVaspVector(rawPosition, scale)
 			});
 		}
 	}
@@ -755,11 +789,7 @@ function stripFdfComment(line: string): string {
 }
 
 function getFdfStringValue(lines: FdfLine[], key: string): string | undefined {
-	const lowerKey = key.toLowerCase();
-	const line = lines.find((entry) => {
-		const tokens = entry.lower.split(/\s+/);
-		return tokens[0] === lowerKey;
-	});
+	const line = findFdfLine(lines, key);
 
 	if (!line) {
 		return undefined;
@@ -769,11 +799,7 @@ function getFdfStringValue(lines: FdfLine[], key: string): string | undefined {
 }
 
 function getFdfBlock(lines: FdfLine[], blockName: string): string[] | undefined {
-	const lowerBlockName = blockName.toLowerCase();
-
-	const startIndex = lines.findIndex((line) =>
-		line.lower === `%block ${lowerBlockName}`
-	);
+	const startIndex = lines.findIndex((line) => isFdfBlockBoundary(line, '%block', blockName));
 
 	if (startIndex < 0) {
 		return undefined;
@@ -782,7 +808,7 @@ function getFdfBlock(lines: FdfLine[], blockName: string): string[] | undefined 
 	const blockLines: string[] = [];
 
 	for (let index = startIndex + 1; index < lines.length; index++) {
-		if (lines[index].lower === `%endblock ${lowerBlockName}`) {
+		if (isFdfBlockBoundary(lines[index], '%endblock', blockName)) {
 			return blockLines;
 		}
 
@@ -793,8 +819,7 @@ function getFdfBlock(lines: FdfLine[], blockName: string): string[] | undefined 
 }
 
 function hasFdfBlock(lines: FdfLine[], blockName: string): boolean {
-	const lowerBlockName = blockName.toLowerCase();
-	return lines.some((line) => line.lower === `%block ${lowerBlockName}`);
+	return lines.some((line) => isFdfBlockBoundary(line, '%block', blockName));
 }
 
 function parseFdfLatticeConstant(lines: FdfLine[]): number {
@@ -898,10 +923,14 @@ function parseFdfSpeciesMap(lines: FdfLine[]): Map<number, string> {
 	for (const line of speciesBlock) {
 		const tokens = line.split(/\s+/);
 		const speciesIndex = parseInt(tokens[0], 10);
+		const atomicNumber = Number(tokens[1]);
 		const label = tokens[2];
 
 		if (Number.isInteger(speciesIndex) && label) {
-			speciesMap.set(speciesIndex, normalizeElementSymbol(label));
+			// Only ordinary positive atomic numbers identify elements here. Preserve
+			// the existing label fallback for ghost and synthetic species.
+			const element = atomicNumberToSymbol(atomicNumber);
+			speciesMap.set(speciesIndex, element || normalizeElementSymbol(label));
 		}
 	}
 
@@ -1138,6 +1167,10 @@ function parseFdfGeometryConstraintLineOperations(
 			continue;
 		}
 
+		if (['center', 'rigid', 'molecule', 'rigid-max', 'molecule-max', 'stress', 'cell-vector', 'cell-angle', 'routine'].includes(keyword)) {
+			return;
+		}
+
 		const parsed = parseFdfConstraintSelector(tokens, index, atoms, speciesAtomicNumbers);
 		index = parsed.nextIndex;
 
@@ -1173,6 +1206,7 @@ function parseFdfGeometryConstraintLineOperations(
 			}
 		}
 
+		previousConstraintOperationIndex = operations.length;
 		operations.push({
 			type: 'constraint',
 			effects
@@ -1239,6 +1273,8 @@ function tokenizeFdfConstraintLine(line: string): string[] {
 	return line
 		.replace(/\[/g, ' [ ')
 		.replace(/\]/g, ' ] ')
+		.replace(/,/g, ' ')
+		.replace(/--/g, ' -- ')
 		.split(/\s+/)
 		.filter((token) => token.length > 0);
 }
@@ -1289,13 +1325,6 @@ function parseFdfConstraintSelector(
 		};
 	}
 
-	if (['center', 'rigid', 'molecule', 'rigid-max', 'molecule-max', 'stress', 'cell-vector', 'cell-angle', 'routine'].includes(selector)) {
-		return {
-			atomIndices: [],
-			nextIndex: tokens.length
-		};
-	}
-
 	throw new Error(`Unsupported Geometry.Constraints selector: ${tokens[startIndex]}`);
 }
 
@@ -1321,9 +1350,9 @@ function parseFdfConstraintIndexSet(
 	}
 
 	if (tokens[startIndex].toLowerCase() === 'from') {
-		const first = parseInt(tokens[startIndex + 1], 10);
+		const first = Number(tokens[startIndex + 1]);
 		const rangeMode = tokens[startIndex + 2]?.toLowerCase();
-		const rangeValue = parseInt(tokens[startIndex + 3], 10);
+		const rangeValue = Number(tokens[startIndex + 3]);
 		let step = 1;
 		let nextIndex = startIndex + 4;
 
@@ -1332,7 +1361,7 @@ function parseFdfConstraintIndexSet(
 		}
 
 		if (tokens[nextIndex]?.toLowerCase() === 'step') {
-			step = parseInt(tokens[nextIndex + 1], 10);
+			step = Number(tokens[nextIndex + 1]);
 			nextIndex += 2;
 		}
 
@@ -1368,19 +1397,19 @@ function parseFdfConstraintIndexSet(
 		let index = startIndex + 1;
 
 		while (index < tokens.length && tokens[index] !== ']') {
-			const first = parseInt(tokens[index], 10);
+			const first = Number(tokens[index]);
 
 			if (!Number.isInteger(first)) {
 				throw new Error('Invalid Geometry.Constraints bracketed index selector.');
 			}
 
 			if (tokens[index + 1] === '--') {
-				const last = parseInt(tokens[index + 2], 10);
+				const last = Number(tokens[index + 2]);
 				let step = 1;
 				index += 3;
 
 				if (tokens[index]?.toLowerCase() === 'step') {
-					step = parseInt(tokens[index + 1], 10);
+					step = Number(tokens[index + 1]);
 					index += 2;
 				}
 
@@ -1402,10 +1431,14 @@ function parseFdfConstraintIndexSet(
 	}
 
 	if (isIntegerToken(tokens[startIndex])) {
-		return {
-			indices: [oneBasedIndexToZeroBased(parseInt(tokens[startIndex], 10), maxIndex)],
-			nextIndex: startIndex + 1
-		};
+		const indices: number[] = [];
+		let nextIndex = startIndex;
+		// Integers select atoms; decimal real tokens start a directional vector.
+		while (nextIndex < tokens.length && isIntegerToken(tokens[nextIndex])) {
+			indices.push(oneBasedIndexToZeroBased(Number(tokens[nextIndex]), maxIndex));
+			nextIndex += 1;
+		}
+		return { indices, nextIndex };
 	}
 
 	throw new Error(`Invalid Geometry.Constraints index selector: ${tokens[startIndex]}`);
@@ -1472,6 +1505,9 @@ function directionVectorToConstraint(
 }
 
 function makeOneBasedIndexRange(first: number, last: number, step: number, maxIndex: number): number[] {
+	oneBasedIndexToZeroBased(first, maxIndex);
+	oneBasedIndexToZeroBased(last, maxIndex);
+
 	if (!Number.isInteger(step) || step <= 0) {
 		throw new Error('Geometry.Constraints step must be a positive integer.');
 	}
@@ -1537,13 +1573,21 @@ function isRealToken(token: string): boolean {
 	return /^[-+]?(?:\d+\.\d*|\.\d+)(?:[EeDd][-+]?\d+)?$/.test(token);
 }
 
-function findFdfLine(lines: FdfLine[], key: string): FdfLine | undefined {
-	const lowerKey = key.toLowerCase();
+function normalizeFdfLabel(label: string): string {
+	return label.toLowerCase().replace(/[-_.]/g, '');
+}
 
-	return lines.find((entry) => {
-		const tokens = entry.lower.split(/\s+/);
-		return tokens[0] === lowerKey;
-	});
+function isFdfBlockBoundary(line: FdfLine, marker: string, blockName: string): boolean {
+	const tokens = line.clean.split(/\s+/);
+	return tokens[0].toLowerCase() === marker &&
+		(tokens[1] !== undefined
+			? normalizeFdfLabel(tokens[1]) === normalizeFdfLabel(blockName)
+			: marker === '%endblock');
+}
+
+function findFdfLine(lines: FdfLine[], key: string): FdfLine | undefined {
+	const normalizedKey = normalizeFdfLabel(key);
+	return lines.find((entry) => normalizeFdfLabel(entry.clean.split(/\s+/)[0]) === normalizedKey);
 }
 
 function lengthUnitToAngstrom(unit: string): number {
@@ -1581,6 +1625,7 @@ function normalizeElementSymbol(label: string): string {
 interface GaussianMoleculeSpecification {
 	atoms: Atom[];
 	translationVectors: Vec3[];
+	warning?: string;
 }
 
 interface GaussianAtomSpec {
@@ -1604,7 +1649,8 @@ function parseGaussianGjf(text: string): AtomicStructure {
 		...(lattice ? { lattice } : {}),
 		atoms: moleculeSpecification.atoms,
 		coordinateMode: 'Cartesian',
-		sourceFormat: 'GJF'
+		sourceFormat: 'GJF',
+		warning: moleculeSpecification.warning
 	};
 }
 
@@ -1695,6 +1741,7 @@ function parseGaussianMoleculeSpecification(
 ): GaussianMoleculeSpecification {
 	const atoms: Atom[] = [];
 	const translationVectors: Vec3[] = [];
+	let warning: string | undefined;
 
 	for (let index = startIndex; index < rawLines.length; index++) {
 		const line = stripGaussianComment(rawLines[index]).trim();
@@ -1719,13 +1766,14 @@ function parseGaussianMoleculeSpecification(
 				);
 			}
 
+			warning = `Partial structure: only the first ${atoms.length} atom(s) are shown. Unsupported or invalid Gaussian molecule specification at line ${index + 1}; this line and the remaining atoms were not read.`;
 			break;
 		}
 
 		atoms.push(atom);
 	}
 
-	return { atoms, translationVectors };
+	return { atoms, translationVectors, warning };
 }
 
 function stripGaussianComment(line: string): string {
@@ -1922,8 +1970,10 @@ function parseQuantumEspressoInput(text: string): AtomicStructure {
 		parseQeNamelist(lines, 'control').get('prefix') ??
 		'Quantum ESPRESSO input';
 
-	const alat = parseQeAlatAngstrom(systemValues);
-	const lattice = parseQeLattice(lines, alat);
+	const explicitAlat = parseQeAlatAngstrom(systemValues);
+	const lattice = parseQeLattice(lines, explicitAlat);
+	// QE derives alat from the first cell vector when A/celldm(1) is absent.
+	const alat = explicitAlat ?? Math.hypot(...lattice[0]);
 	const speciesMap = parseQeSpeciesMap(lines);
 	const { atoms, coordinateMode } = parseQeAtoms(lines, speciesMap, lattice, alat);
 
@@ -1944,8 +1994,9 @@ function preprocessQeLines(text: string): string[] {
 	return text
 		.split(/\r?\n/)
 		.map((line) => {
-			const commentIndex = line.indexOf('!');
-			return commentIndex >= 0 ? line.slice(0, commentIndex).trim() : line.trim();
+			// A quoted prefix or path may contain ! without starting a comment.
+			return line.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"|!.*$/g,
+				(token) => token.startsWith('!') ? '' : token).trim();
 		})
 		.filter((line) => line.length > 0);
 }
@@ -1953,31 +2004,31 @@ function preprocessQeLines(text: string): string[] {
 function parseQeNamelist(lines: string[], name: string): Map<string, string> {
 	const values = new Map<string, string>();
 	const lowerName = `&${name.toLowerCase()}`;
-	const startIndex = lines.findIndex((line) => line.toLowerCase().startsWith(lowerName));
+	const startIndex = lines.findIndex((line) =>
+		line.split(/\s+/)[0].toLowerCase() === lowerName
+	);
 
 	if (startIndex < 0) {
 		return values;
 	}
 
-	for (let index = startIndex + 1; index < lines.length; index++) {
-		const line = lines[index];
-
-		if (line.trim() === '/') {
+	// Include assignments on the opening line and stop at an unquoted slash.
+	// Slashes and commas inside quoted strings are part of the value.
+	const text = lines.slice(startIndex).join('\n').slice(lowerName.length);
+	let body = '';
+	for (const token of text.match(/'(?:[^']|'')*'|"(?:[^"]|"")*"|\/|[^'"/]+/g) ?? []) {
+		if (token === '/') {
 			break;
 		}
+		body += token;
+	}
 
-		for (const assignment of line.split(',')) {
-			const match = assignment.match(/^\s*([a-zA-Z0-9_().]+)\s*=\s*(.+?)\s*$/);
-
-			if (!match) {
-				continue;
-			}
-
-			values.set(
-				match[1].toLowerCase(),
-				match[2].replace(/^['"]|['"]$/g, '').trim()
-			);
-		}
+	const assignment = /([a-zA-Z][a-zA-Z0-9_]*(?:\(\s*\d+\s*\))?)\s*=\s*('(?:[^']|'')*'|"(?:[^"]|"")*"|[^,\s]+)/g;
+	for (const match of body.matchAll(assignment)) {
+		values.set(
+			match[1].toLowerCase().replace(/\s/g, ''),
+			match[2].replace(/^['"]|['"]$/g, '').trim()
+		);
 	}
 
 	return values;
@@ -1999,29 +2050,24 @@ function parseQeIbrav(systemValues: Map<string, string>): number | undefined {
 	return parsed;
 }
 
-function parseQeAlatAngstrom(systemValues: Map<string, string>): number {
+function parseQeAlatAngstrom(systemValues: Map<string, string>): number | undefined {
 	const aValue = systemValues.get('a');
-
-	if (aValue !== undefined) {
-		const a = Number(aValue);
-		if (Number.isFinite(a)) {
-			return a;
-		}
-	}
-
 	const celldm1Value = systemValues.get('celldm(1)');
+	const value = aValue ?? celldm1Value;
 
-	if (celldm1Value !== undefined) {
-		const celldm1 = Number(celldm1Value);
-		if (Number.isFinite(celldm1)) {
-			return celldm1 * lengthUnitToAngstrom('Bohr');
-		}
+	if (value === undefined) {
+		return undefined;
 	}
 
-	return 1.0;
+	const parsed = Number(value.replace(/[Dd]/, 'E'));
+	if (!Number.isFinite(parsed)) {
+		throw new Error(`Invalid QE lattice parameter: ${value}`);
+	}
+
+	return aValue !== undefined ? parsed : parsed * lengthUnitToAngstrom('Bohr');
 }
 
-function parseQeLattice(lines: string[], alat: number): [Vec3, Vec3, Vec3] {
+function parseQeLattice(lines: string[], alat: number | undefined): [Vec3, Vec3, Vec3] {
 	const headerIndex = lines.findIndex((line) =>
 		line.toLowerCase().startsWith('cell_parameters')
 	);
@@ -2035,7 +2081,7 @@ function parseQeLattice(lines: string[], alat: number): [Vec3, Vec3, Vec3] {
 	}
 
 	const header = lines[headerIndex];
-	const unit = parseQeHeaderUnit(header) ?? 'alat';
+	const unit = parseQeHeaderUnit(header) ?? (alat === undefined ? 'bohr' : 'alat');
 	const scale = qeLengthScaleToAngstrom(unit, alat);
 
 	return [
@@ -2195,7 +2241,7 @@ function parseQeCoordinateFormat(unit: string): QeCoordinateFormat {
 	throw new Error(`Unsupported ATOMIC_POSITIONS unit: ${unit}`);
 }
 
-function qeLengthScaleToAngstrom(unit: string, alat: number): number {
+function qeLengthScaleToAngstrom(unit: string, alat: number | undefined): number {
 	const normalized = unit.toLowerCase();
 
 	if (normalized.startsWith('ang')) {
@@ -2206,7 +2252,10 @@ function qeLengthScaleToAngstrom(unit: string, alat: number): number {
 		return lengthUnitToAngstrom('Bohr');
 	}
 
-	if (normalized.startsWith('alat')) {
+	if (normalized === 'alat') {
+		if (alat === undefined) {
+			throw new Error('CELL_PARAMETERS alat requires A or celldm(1) in &SYSTEM.');
+		}
 		return alat;
 	}
 

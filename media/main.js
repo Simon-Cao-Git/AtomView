@@ -56,8 +56,6 @@ window.addEventListener('message', (event) => {
 	if (message.command === 'showStructure') {
 		const hadStructure = Boolean(latestStructure);
 		const previousFrameIndex = currentFrameIndex;
-		const incomingLatticeSignature = getLatticeSignature(message.structure?.lattice);
-		const latticeChanged = incomingLatticeSignature !== currentLatticeSignature;
 		latestStructure = message.structure;
 
 		if (!hadStructure) {
@@ -69,12 +67,10 @@ window.addEventListener('message', (event) => {
 			currentFrameIndex = Math.min(previousFrameIndex, Math.max(frameCount - 1, 0));
 		}
 
-		showStatus('');
+		showStatus(latestStructure.warning ?? '');
 		updateFrameSlider();
-		renderCurrentFrame({
-			preserveCamera: hadStructure,
-			forceFullRender: latticeChanged
-		});
+		// The current frame's lattice determines whether atom meshes can be reused.
+		renderCurrentFrame({ preserveCamera: hadStructure });
 	}
 });
 
@@ -140,6 +136,12 @@ function initViewer() {
 	statusElement.style.top = '16px';
 	statusElement.style.color = 'var(--vscode-foreground)';
 	statusElement.style.display = 'none';
+	statusElement.style.whiteSpace = 'pre-wrap';
+	statusElement.style.maxWidth = 'calc(100vw - 210px)';
+	statusElement.style.background = 'rgba(0, 0, 0, 0.80)';
+	statusElement.style.padding = '8px';
+	statusElement.style.pointerEvents = 'none';
+	statusElement.style.zIndex = '11';
 	document.body.appendChild(statusElement);
 
 	hoverElement = document.createElement('pre');
@@ -344,16 +346,14 @@ function updateLatticeAxisViewer(lattice) {
 		return;
 	}
 
-	if (!hasUsableLattice(lattice)) {
-		if (latticeAxisGroup) {
-			axisScene.remove(latticeAxisGroup);
-			latticeAxisGroup = undefined;
-		}
-		return;
-	}
-
 	if (latticeAxisGroup) {
 		axisScene.remove(latticeAxisGroup);
+		disposeObject3D(latticeAxisGroup);
+		latticeAxisGroup = undefined;
+	}
+
+	if (!hasUsableLattice(lattice)) {
+		return;
 	}
 
 	latticeAxisGroup = new THREE.Group();

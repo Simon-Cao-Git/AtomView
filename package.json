@@ -24,9 +24,6 @@
 		"SIESTA",
 		"Quantum ESPRESSO"
     ],
-	"activationEvents": [
-		"onCommand:atomview.openPreview"
-	],
 	"main": "./out/extension.js",
 	"contributes": {
 
@@ -51,6 +48,7 @@
 	},
 	"scripts": {
 		"vscode:prepublish": "npm run compile",
+		"test": "node --test test/*.test.cjs",
 		"compile": "tsc -p ./",
 		"watch": "tsc -w -p ./"
 	},
