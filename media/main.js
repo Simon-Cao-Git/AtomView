@@ -915,8 +915,10 @@ function clearHoverInfo() {
 }
 
 function showAtomHoverInfo(atom, atomIndex, frameIndex, coordinateMode, sourceFormat) {
+	const sourceLabel = atom.sourceLabel?.split('(')[0];
+	const label = sourceLabel && !/^\d+$/.test(sourceLabel) ? sourceLabel : atom.element;
 	const lines = [
-		`Atom ${atomIndex + 1}: ${atom.element}`
+		`Atom ${atom.sourceIndex ?? atomIndex + 1}: ${label}${atom.ghost ? ' (ghost)' : ''}`
 	];
 
 	if (hasTrajectoryFrames()) {
@@ -927,7 +929,18 @@ function showAtomHoverInfo(atom, atomIndex, frameIndex, coordinateMode, sourceFo
 		lines.push(`Direct: ${formatVector(atom.fractionalPosition)}`);
 	}
 
-	lines.push(`Cartesian: ${formatVector(atom.position)}`);
+	lines.push(`Cartesian (Å): ${formatVector(atom.position)}`);
+
+	if (atom.zmatrix) {
+		if (atom.zmatrix.context) { lines.splice(1, 0, atom.zmatrix.context); }
+		if (atom.zmatrix.entries.length) {
+			lines.push('', atom.zmatrix.context?.startsWith('Molecule') ? 'Z-matrix — local indices' : 'Z-matrix');
+			for (const entry of atom.zmatrix.entries) {
+				const symbolic = !/^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][-+]?\d+)?$/.test(entry.source);
+				lines.push(`${entry.label}: ${symbolic ? entry.source + ' → ' : ''}${entry.value.toFixed(6)}${entry.unit === '°' ? '°' : entry.unit ? ' ' + entry.unit : ''}`);
+			}
+		}
+	}
 
 	const constrainedDirections = [];
 
@@ -998,6 +1011,7 @@ function drawBonds(structure, group) {
 		for (let j = i + 1; j < structure.atoms.length; j++) {
 			const atomA = structure.atoms[i];
 			const atomB = structure.atoms[j];
+			if (atomA.ghost || atomB.ghost) { continue; }
 
 			const positionA = new THREE.Vector3(...atomA.position);
 			const positionB = new THREE.Vector3(...atomB.position);

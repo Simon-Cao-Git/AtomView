@@ -2,7 +2,7 @@
 	"name": "atomview",
 	"displayName": "AtomView",
 	"description": "Lightweight live atomic structure preview inside VS Code",
-	"version": "0.3.3",
+	"version": "0.4.0",
 	"publisher": "PurunSimonCao",
 	"private": false,
 	"repository": {

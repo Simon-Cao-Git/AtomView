@@ -14,6 +14,10 @@ type SourceFormat =
 type ParserFamily = 'vasp' | 'siesta' | 'gaussian' | 'qe';
 
 interface Atom {
+	sourceIndex?: number;
+	sourceLabel?: string;
+	ghost?: boolean;
+	zmatrix?: ZMatrixInfo;
 	element: string;
 	position: Vec3; // Cartesian coordinates in Angstrom
 	fractionalPosition?: Vec3;
@@ -239,7 +243,7 @@ class AtomViewPanel {
 			this.panel.title = `AtomView: ${fileName}`;
 			this.sendFrame('showStructure');
 		} catch (error) {
-			this.postStatus(`Failed to parse ${fileName}: ${error instanceof Error ? error.message : String(error)}`);
+			this.postStatus(`Failed to parse ${fileName}: ${error instanceof Error ? error.message : String(error)}${this.structure ? "\nShowing the last successfully parsed structure." : ""}`);
 		}
 	}
 
@@ -796,9 +800,7 @@ function parseSinglePoscarBlock(
 function parseSiestaFdf(text: string): AtomicStructure {
 	const lines = preprocessFdfLines(text);
 
-	if (hasFdfBlock(lines, 'ZMATRIX')) {
-		throw new Error('SIESTA Z-matrix input is not supported yet. AtomView currently supports only explicit x y z coordinates via %block AtomicCoordinatesAndAtomicSpecies.');
-	}
+	const hasZmatrix = hasFdfBlock(lines, 'ZMATRIX');
 
 	const title =
 		getFdfStringValue(lines, 'SystemName') ??
@@ -809,8 +811,10 @@ function parseSiestaFdf(text: string): AtomicStructure {
 	const lattice = parseFdfLattice(lines, latticeConstant);
 	const speciesMap = parseFdfSpeciesMap(lines);
 	const speciesAtomicNumbers = parseFdfSpeciesAtomicNumberMap(lines);
-	const coordinateFormat = parseFdfCoordinateFormat(lines);
-	const atoms = parseFdfAtoms(
+	const coordinateFormat = hasZmatrix ? 'CartesianAngstrom' : parseFdfCoordinateFormat(lines);
+	const atoms = hasZmatrix
+		? parseSiestaZmatrix(text, lines, lattice, latticeConstant, speciesMap, speciesAtomicNumbers)
+		: parseFdfAtoms(
 		lines,
 		speciesMap,
 		lattice,
@@ -818,7 +822,7 @@ function parseSiestaFdf(text: string): AtomicStructure {
 		coordinateFormat
 	);
 
-	applyFdfGeometryConstraints(lines, atoms, speciesAtomicNumbers);
+	if (!hasZmatrix) { applyFdfGeometryConstraints(lines, atoms, speciesAtomicNumbers); }
 
 	if (atoms.length === 0) {
 		throw new Error('No atoms found in %block AtomicCoordinatesAndAtomicSpecies.');
@@ -1059,7 +1063,7 @@ function parseFdfAtoms(
 	const atomBlock = getFdfBlock(lines, 'AtomicCoordinatesAndAtomicSpecies');
 
 	if (!atomBlock) {
-		throw new Error('Missing %block AtomicCoordinatesAndAtomicSpecies. AtomView currently supports only explicit SIESTA x y z coordinate blocks, not Z-matrix-style structure definitions.');
+		throw new Error('Missing %block AtomicCoordinatesAndAtomicSpecies or %block Zmatrix.');
 	}
 
 	return atomBlock.map((line) => {
@@ -1704,7 +1708,7 @@ function parseGaussianGjf(text: string): AtomicStructure {
 	const moleculeSpecification = parseGaussianMoleculeSpecification(rawLines, moleculeStartIndex);
 
 	if (moleculeSpecification.atoms.length === 0) {
-		throw new Error('No Cartesian atoms found in Gaussian molecule specification.');
+		throw new Error('No renderable atoms found in Gaussian molecule specification.');
 	}
 
 	const lattice = gaussianTranslationVectorsToLattice(moleculeSpecification.translationVectors);
@@ -1791,7 +1795,7 @@ function parseGaussianTitle(rawLines: string[]): string | undefined {
 }
 
 function isGaussianChargeMultiplicityLine(line: string): boolean {
-	const tokens = line.trim().split(/\s+/);
+	const tokens = line.trim().split(/[\s,]+/);
 
 	if (tokens.length < 2 || tokens.length % 2 !== 0) {
 		return false;
@@ -1804,113 +1808,46 @@ function parseGaussianMoleculeSpecification(
 	rawLines: string[],
 	startIndex: number
 ): GaussianMoleculeSpecification {
+	const units = gaussianUnits(rawLines);
+	let end = startIndex;
+	while (end < rawLines.length) {
+		const line = stripGaussianComment(rawLines[end]).trim();
+		if ((!line && !rawLines[end].trim().startsWith('!')) || /^(variables|constants)\s*:?$/i.test(line) || /^--link1--$/i.test(line)) { break; }
+		end++;
+	}
+	const symbols = gaussianSymbols(rawLines, end);
+	const centers: GaussianCenter[] = [];
 	const atoms: Atom[] = [];
 	const translationVectors: Vec3[] = [];
 	let warning: string | undefined;
-
-	for (let index = startIndex; index < rawLines.length; index++) {
+	for (let index = startIndex; index < end; index++) {
 		const line = stripGaussianComment(rawLines[index]).trim();
-
-		if (line.length === 0) {
-			break;
-		}
-
-		const translationVector = parseGaussianTranslationVectorLine(line);
-
-		if (translationVector) {
-			translationVectors.push(translationVector);
+		if (!line) { continue; }
+		// Lattice failures affect the entire structure, not just a suffix of atoms.
+		if (/^tv(?:[\s,]|$)/i.test(line)) {
+			const fields = gaussianFields(line);
+			if (fields.length !== 4) { throw new Error(`Invalid Gaussian TV line ${index + 1}.`); }
+			translationVectors.push(fields.slice(1).map(t => zmValue(t, symbols) * units.length) as Vec3);
 			continue;
 		}
-
-		const atom = parseGaussianCartesianAtomLine(line);
-
-		if (!atom) {
-			if (atoms.length === 0) {
-				throw new Error(
-					'Gaussian molecule specification does not appear to be supported Cartesian x y z format. AtomView does not currently support Gaussian Z-matrix or mixed internal-coordinate molecule specifications.'
-				);
-			}
-
-			warning = `Partial structure: only the first ${atoms.length} atom(s) are shown. Unsupported or invalid Gaussian molecule specification at line ${index + 1}; this line and the remaining atoms were not read.`;
+		try {
+			const center = gaussianCenter(gaussianFields(line), centers, symbols, units);
+			if (!center.position.every(Number.isFinite)) { throw new Error('Non-finite converted coordinates.'); }
+			centers.push(center);
+			if (!center.dummy) { atoms.push(center); }
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			if (!atoms.length) { throw new Error(`Gaussian geometry at line ${index + 1}: ${reason}`); }
+			warning = `Partial structure: only the first ${atoms.length} atom(s) are shown. Gaussian geometry at line ${index + 1}, source atom ${centers.length + 1}: ${reason} This atom and the remaining atoms were not read.`;
 			break;
 		}
-
-		atoms.push(atom);
 	}
-
 	return { atoms, translationVectors, warning };
 }
 
 function stripGaussianComment(line: string): string {
 	const commentIndex = line.indexOf('!');
 	return commentIndex >= 0 ? line.slice(0, commentIndex) : line;
-}
-
-function parseGaussianTranslationVectorLine(line: string): Vec3 | undefined {
-	const tokens = line.trim().split(/\s+/);
-
-	if (tokens.length < 4 || tokens[0].toUpperCase() !== 'TV') {
-		return undefined;
-	}
-
-	const vector: Vec3 = [
-		Number(tokens[1]),
-		Number(tokens[2]),
-		Number(tokens[3])
-	];
-
-	if (vector.some((value) => !Number.isFinite(value))) {
-		throw new Error(`Invalid Gaussian TV line: ${line}`);
-	}
-
-	return vector;
-}
-
-function parseGaussianCartesianAtomLine(line: string): Atom | undefined {
-	const tokens = line.trim().split(/\s+/);
-
-	if (tokens.length < 4) {
-		return undefined;
-	}
-
-	const atomSpec = parseGaussianAtomSpec(tokens[0]);
-
-	if (!atomSpec) {
-		return undefined;
-	}
-
-	let coordinateStartIndex = 1;
-	let freezeCode: number | undefined;
-
-	if (tokens.length >= 5) {
-		freezeCode = parseGaussianFreezeCode(tokens[coordinateStartIndex]);
-
-		if (freezeCode !== undefined) {
-			coordinateStartIndex += 1;
-		}
-	}
-
-	const coordinateTokens = tokens.slice(coordinateStartIndex, coordinateStartIndex + 3);
-
-	if (coordinateTokens.length < 3 || !coordinateTokens.every(isPlainNumberToken)) {
-		return undefined;
-	}
-
-	const position: Vec3 = [
-		gaussianNumberToNumber(coordinateTokens[0]),
-		gaussianNumberToNumber(coordinateTokens[1]),
-		gaussianNumberToNumber(coordinateTokens[2])
-	];
-
-	if (position.some((value) => !Number.isFinite(value))) {
-		return undefined;
-	}
-
-	return {
-		element: atomSpec.element,
-		selectiveDynamics: gaussianFreezeCodeToSelectiveDynamics(freezeCode),
-		position
-	};
 }
 
 function parseGaussianAtomSpec(token: string): GaussianAtomSpec | undefined {
@@ -1955,14 +1892,6 @@ function parseElementFromGaussianLabel(label: string): string | undefined {
 	}
 
 	return undefined;
-}
-
-function parseGaussianFreezeCode(token: string | undefined): number | undefined {
-	if (!token || !/^[-+]?\d+$/.test(token)) {
-		return undefined;
-	}
-
-	return Number(token);
 }
 
 function gaussianFreezeCodeToSelectiveDynamics(
@@ -2470,4 +2399,358 @@ function getNonce() {
 	}
 
 	return text;
+}
+/* Z-matrix geometry and source metadata                                      */
+
+interface ZMatrixEntry {
+	label: string;
+	source: string;
+	value: number;
+	unit: string;
+}
+
+interface ZMatrixInfo {
+	context?: string;
+	entries: ZMatrixEntry[];
+}
+
+const ZM_BOHR = 0.529177210903;
+const ZM_DEG = Math.PI / 180;
+
+function zmAdd(a: Vec3, b: Vec3): Vec3 { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
+function zmSub(a: Vec3, b: Vec3): Vec3 { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+function zmDot(a: Vec3, b: Vec3): number { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+function zmCross(a: Vec3, b: Vec3): Vec3 {
+	return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+function zmUnit(a: Vec3): Vec3 {
+	const length = Math.hypot(...a);
+	if (length < 1e-12) { throw new Error('Degenerate Z-matrix reference geometry (coincident or collinear centers).'); }
+	return scaleVector(a, 1 / length);
+}
+function zmNumber(token: string): number {
+	if (!isPlainNumberToken(token)) { throw new Error(`Invalid numeric value "${token}".`); }
+	const value = gaussianNumberToNumber(token);
+	if (!Number.isFinite(value)) { throw new Error(`Non-finite value "${token}".`); }
+	return value;
+}
+function zmValue(token: string, symbols: Map<string, number>, signed = true): number {
+	if (isPlainNumberToken(token)) { return zmNumber(token); }
+	const negative = signed && token.startsWith('-');
+	const key = (signed ? token.replace(/^[+-]/, '') : token).toLowerCase();
+	const value = symbols.get(key);
+	if (value === undefined) { throw new Error(`Undefined Z-matrix variable "${token}".`); }
+	return negative ? -value : value;
+}
+function zmEntry(label: string, source: string, value: number, unit: string): ZMatrixEntry {
+	return { label, source, value, unit };
+}
+function zmCheckInternal(r: number, angle?: number) {
+	if (!(r > 0)) { throw new Error('Z-matrix distance must be positive.'); }
+	if (angle !== undefined && !(angle > 0 && angle < Math.PI)) {
+		throw new Error('Z-matrix bond angle must be between 0 and 180 degrees.');
+	}
+}
+
+// Signed torsion P-i-j-k, matching SIESTA's Z2C: normal = (i-j) x (k-j).
+function zmInternal(i: Vec3, j: Vec3, k: Vec3, r: number, angle: number, torsion: number): Vec3 {
+	zmCheckInternal(r, angle);
+	const axis = zmUnit(zmSub(i, j));
+	const normal = zmUnit(zmCross(axis, zmUnit(zmSub(k, j))));
+	const plane = zmCross(normal, axis);
+	return zmAdd(i, zmAdd(scaleVector(axis, -r * Math.cos(angle)),
+		zmAdd(scaleVector(plane, r * Math.sin(angle) * Math.cos(torsion)),
+			scaleVector(normal, r * Math.sin(angle) * Math.sin(torsion)))));
+}
+
+function zmThirdGaussian(i: Vec3, j: Vec3, r: number, angle: number): Vec3 {
+	zmCheckInternal(r, angle);
+	const axis = zmUnit(zmSub(j, i));
+	// The usual input orientation has atom 2 on +z and atom 3 in the +x/z plane.
+	const seed: Vec3 = Math.abs(axis[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+	const perpendicular = zmUnit(zmSub(seed, scaleVector(axis, zmDot(seed, axis))));
+	return zmAdd(i, scaleVector(zmAdd(scaleVector(axis, Math.cos(angle)),
+		scaleVector(perpendicular, Math.sin(angle))), r));
+}
+
+// SIESTA 5.4.2 Z2CGen uses a rotated local frame for atom 3, including the
+// input azimuth when the first bond lies along a coordinate axis.
+function zmThirdSiesta(i: Vec3, j: Vec3, r: number, angle: number, torsion: number, phiRef: number): Vec3 {
+	const bond = zmSub(i, j);
+	const length = Math.hypot(...bond);
+	zmUnit(bond);
+	const theta = Math.acos(Math.max(-1, Math.min(1, bond[2] / length)));
+	const phi = Math.abs(bond[0]) > 1e-8 && Math.abs(bond[1]) > 1e-8 ? Math.atan2(bond[1], bond[0]) : phiRef;
+	const p = zmInternal([length, 0, 0], [0, 0, 0], [length, 0, 1], r, angle, torsion);
+	const rotated: Vec3 = [p[0] * Math.cos(phi) - p[1] * Math.sin(phi), p[0] * Math.sin(phi) + p[1] * Math.cos(phi), p[2]];
+	const axis: Vec3 = [Math.sin(phi), -Math.cos(phi), 0];
+	const t = Math.PI / 2 - theta;
+	return zmAdd(j, zmAdd(scaleVector(rotated, Math.cos(t)),
+		zmAdd(scaleVector(zmCross(axis, rotated), Math.sin(t)), scaleVector(axis, zmDot(axis, rotated) * (1 - Math.cos(t))))));
+}
+
+// Commas delimit fields, except inside Gaussian's parenthesized atom metadata.
+function gaussianFields(line: string): string[] {
+	const fields: string[] = [];
+	let field = '', depth = 0;
+	for (const c of line.trim()) {
+		if (c === '(') { depth++; }
+		if (c === ')') { depth--; }
+		if (depth < 0) { throw new Error('Unbalanced Gaussian atom metadata.'); }
+		if (depth === 0 && /[\s,]/.test(c)) {
+			if (field) { fields.push(field); field = ''; }
+		} else { field += c; }
+	}
+	if (depth !== 0) { throw new Error('Unbalanced Gaussian atom metadata.'); }
+	if (field) { fields.push(field); }
+	return fields;
+}
+
+function gaussianUnits(rawLines: string[]): { length: number; angle: number } {
+	const start = rawLines.findIndex(line => line.trim().startsWith('#'));
+	let route = '';
+	for (let i = start; i >= 0 && i < rawLines.length && rawLines[i].trim(); i++) { route += ' ' + rawLines[i]; }
+	const result = { length: 1, angle: ZM_DEG };
+	const match = route.match(/\bunits\s*(?:=\s*)?(\([^)]*\)|[a-z]+)/i);
+	if (!match) { return result; }
+	for (const unit of match[1].replace(/[()]/g, '').toLowerCase().split(/[\s,]+/).filter(Boolean)) {
+		if (unit === 'au') { result.length = ZM_BOHR; }
+		else if (unit === 'ang') { result.length = 1; }
+		else if (unit === 'rad') { result.angle = 1; }
+		else if (unit === 'deg') { result.angle = ZM_DEG; }
+		else { throw new Error(`Unsupported Gaussian Units option "${unit}".`); }
+	}
+	return result;
+}
+
+function gaussianSymbols(rawLines: string[], start: number): Map<string, number> {
+	const symbols = new Map<string, number>();
+	const separator = stripGaussianComment(rawLines[start] ?? '').trim();
+	if (separator && !/^(variables|constants)\s*:?$/i.test(separator)) { return symbols; }
+	// A blank line or Variables: ends geometry and starts variables. A second
+	// separator starts constants; the next ends the symbol definitions. Both
+	// sections supply starting coordinates, irrespective of optimization status.
+	let constants = /^constants\s*:?$/i.test(separator);
+	for (let i = start + 1; i < rawLines.length; i++) {
+		if (rawLines[i].trim().startsWith('!')) { continue; }
+		const line = stripGaussianComment(rawLines[i]).trim();
+		if (!line || /^constants\s*:?$/i.test(line)) {
+			if (constants) { break; }
+			constants = true;
+			continue;
+		}
+		const match = line.match(/^([a-z][\w]*)\s*(?:=\s*|\s+)([-+\d.][\w.+-]*)(?:\s+.*)?$/i);
+		if (!match || !isPlainNumberToken(match[2])) { break; } // Connectivity/basis/next job begins.
+		const key = match[1].toLowerCase();
+		if (symbols.has(key)) { throw new Error(`Duplicate Z-matrix variable "${match[1]}" at line ${i + 1}.`); }
+		symbols.set(key, zmNumber(match[2]));
+	}
+	return symbols;
+}
+
+interface GaussianCenter extends Atom { dummy?: boolean; label: string; }
+
+function gaussianCenter(fields: string[], centers: GaussianCenter[], symbols: Map<string, number>, units: { length: number; angle: number }): GaussianCenter {
+	const label = fields[0] === '-1' ? '-1' : fields[0].split('(')[0].split('-')[0];
+	const dummy = /^x\d*$/i.test(label) || label === '-1';
+	const ghost = /-bq(?:\(|$)/i.test(fields[0]) || /^bq\d*$/i.test(label);
+	const spec = parseGaussianAtomSpec(fields[0]);
+	if (!spec && !dummy && !ghost) { throw new Error(`Invalid Gaussian atom "${fields[0]}".`); }
+	const sourceIndex = centers.length + 1;
+	const atom: GaussianCenter = { element: dummy ? 'X' : /^bq\d*$/i.test(label) ? 'Bq' : spec?.element ?? 'Bq', label, sourceIndex, sourceLabel: fields[0], ghost, dummy, position: [0, 0, 0] };
+	const val = (token: string) => zmValue(token, symbols);
+	const reference = (token: string): GaussianCenter => {
+		if (/^\d+$/.test(token)) {
+			const center = centers[Number(token) - 1];
+			if (center) { return center; }
+		} else {
+			const matches = centers.filter(c => c.label.toLowerCase() === token.toLowerCase());
+			if (matches.length === 1) { return matches[0]; }
+		}
+		throw new Error(`Unavailable or ambiguous reference atom "${token}".`);
+	};
+	let data = fields.slice(1);
+	// A zero after the element denotes symbolic Cartesian coordinates. Negative
+	// freeze codes are unambiguous; an extra Cartesian freeze field is retained.
+	let freeze: number | undefined;
+	const explicitCartesian = data.length >= 4 && (data[0] === '0' ||
+		(data.length === 4 && /^[+-]?\d+$/.test(data[0]) && (Number(data[0]) < 0 || centers.length === 0)));
+	if (explicitCartesian) { freeze = Number(data.shift()); }
+	else if (data.length >= 5 && /^-\d+$/.test(data[0])) { freeze = Number(data.shift()); }
+	const cartesian = explicitCartesian || data.length === 3 || (data.length > 3 && isPlainNumberToken(data[0]) && !/^\d+$/.test(data[0]));
+	if (cartesian) {
+		if (data.length < 3) { throw new Error('Incomplete Cartesian coordinate record.'); }
+		atom.position = data.slice(0, 3).map(t => val(t) * units.length) as Vec3;
+		atom.selectiveDynamics = gaussianFreezeCodeToSelectiveDynamics(freeze);
+		if (data.slice(0, 3).some(t => !isPlainNumberToken(t))) {
+			atom.zmatrix = { context: 'Cartesian input', entries: data.slice(0, 3).map((t, n) => zmEntry(['x', 'y', 'z'][n], t, atom.position[n], 'Å')) };
+		}
+		return atom;
+	}
+	const count = Math.min(centers.length, 3);
+	if (data.length < 2 * count || (count < 3 && data.length !== 2 * count)) { throw new Error('Incomplete or unsupported Z-matrix atom record.'); }
+	if (data.length > 6) {
+		if (!/^[+-]?\d+$/.test(data[6])) { throw new Error('Expected Z-matrix format code before trailing atom metadata.'); }
+		const format = Number(data[6]);
+		if (format === 1 || format === -1) { throw new Error('Gaussian alternate two-angle Z-matrix format is not supported.'); }
+		if (format !== 0) { throw new Error(`Unsupported Z-matrix format code ${format}.`); }
+	}
+	atom.zmatrix = { entries: [] }; // Internal-coordinate freeze flags are not x/y/z locks.
+	if (count === 0) { return atom; }
+	const i = reference(data[0]);
+	const r = val(data[1]) * units.length;
+	zmCheckInternal(r);
+	atom.zmatrix.entries.push(zmEntry(`Distance ${sourceIndex}–${data[0]}`, data[1], r, 'Å'));
+	if (count === 1) { atom.position = zmAdd(i.position, [0, 0, r]); return atom; }
+	const j = reference(data[2]);
+	if (i === j) { throw new Error('Z-matrix references must be distinct.'); }
+	const a = val(data[3]) * units.angle;
+	atom.zmatrix.entries.push(zmEntry(`Angle ${sourceIndex}–${data[0]}–${data[2]}`, data[3], a / ZM_DEG, '°'));
+	if (count === 2) { atom.position = zmThirdGaussian(i.position, j.position, r, a); return atom; }
+	const k = reference(data[4]);
+	if (k === i || k === j) { throw new Error('Z-matrix references must be distinct.'); }
+	const b = val(data[5]) * units.angle;
+	atom.position = zmInternal(i.position, j.position, k.position, r, a, b);
+	atom.zmatrix.entries.push(zmEntry(`Dihedral ${sourceIndex}–${data[0]}–${data[2]}–${data[4]}`, data[5], b / ZM_DEG, '°'));
+	return atom;
+}
+
+interface SiestaZRow {
+	fields: string[];
+	line: number;
+	mode: 'cartesian' | 'scaled' | 'fractional';
+	molecule?: number;
+	local: number;
+}
+
+function parseSiestaZmatrix(text: string, lines: FdfLine[], lattice: [Vec3, Vec3, Vec3], latticeConstant: number, species: Map<number, string>, atomicNumbers: Map<number, number>): Atom[] {
+	const lengthName = (getFdfStringValue(lines, 'ZM.UnitsLength') ?? 'Bohr').toLowerCase();
+	const angleName = (getFdfStringValue(lines, 'ZM.UnitsAngle') ?? 'rad').toLowerCase();
+	if (!['bohr', 'ang', 'angstrom'].includes(lengthName)) { throw new Error(`Invalid Z-matrix length units "${lengthName}".`); }
+	if (!['rad', 'radians', 'deg', 'degrees'].includes(angleName)) { throw new Error(`Invalid Z-matrix angle units "${angleName}".`); }
+	const lengthUnit = lengthName === 'bohr' ? ZM_BOHR : 1;
+	const angleUnit = angleName.startsWith('rad') ? 1 : ZM_DEG;
+	// Use original lines for diagnostics rather than the comment/blank-stripped FDF list.
+	const raw = text.split(/\r?\n/);
+	const start = raw.findIndex(line => /^%block\s+/i.test(line.trim()) && normalizeFdfLabel(line.trim().split(/\s+/)[1]) === 'zmatrix');
+	const rows: SiestaZRow[] = [];
+	const definitions: { fields: string[]; line: number; constraint: boolean }[] = [];
+	let mode: SiestaZRow['mode'] = 'cartesian';
+	let section = '', molecule = 0, local = 0, ended = false;
+	for (let n = start + 1; n < raw.length; n++) {
+		const line = stripFdfComment(raw[n]).trim();
+		if (!line) { continue; }
+		if (/^%endblock(?:\s|$)/i.test(line)) {
+			const name = line.split(/\s+/)[1];
+			if (name && normalizeFdfLabel(name) !== 'zmatrix') { throw new Error(`Z-matrix: mismatched endblock at line ${n + 1}.`); }
+			ended = true; break;
+		}
+		const header = line.toLowerCase();
+		if (/^molecule(?:[\s_.-]+(?:cartesian|scaled|fractional))?$/.test(header)) {
+			section = 'molecule'; molecule++; local = 0;
+			mode = header.includes('frac') ? 'fractional' : header.includes('scal') ? 'scaled' : 'cartesian';
+			continue;
+		}
+		if (/^(cartesian|scaled|fractional)$/i.test(line)) {
+			section = 'coordinates'; mode = header as SiestaZRow['mode']; local = 0; continue;
+		}
+		if (/^(variables?|constants?|constraints?)$/i.test(line)) { section = header; continue; }
+		const fields = line.split(/[\s,=]+/);
+		if (section.startsWith('variable') || section.startsWith('constant') || section.startsWith('constraint')) {
+			definitions.push({ fields, line: n + 1, constraint: section.startsWith('constraint') });
+		} else if (section === 'coordinates' || section === 'molecule') {
+			rows.push({ fields, line: n + 1, mode, molecule: section === 'molecule' ? molecule : undefined, local: ++local });
+		} else { throw new Error(`Z-matrix: unsupported subsection or missing heading at line ${n + 1}.`); }
+	}
+	if (!ended) { throw new Error('Missing %endblock Zmatrix.'); }
+	if (!rows.length) { throw new Error('No atoms found in Z-matrix.'); }
+	const symbols = new Map<string, number>();
+	for (const definition of definitions) {
+		try {
+			const f = definition.fields;
+			if (f.length !== (definition.constraint ? 4 : 2)) { throw new Error('Invalid symbol definition.'); }
+			const key = f[0].toLowerCase();
+			if (symbols.has(key)) { throw new Error(`Duplicate Z-matrix variable "${f[0]}".`); }
+			let value: number;
+			if (definition.constraint) {
+				const base = symbols.get(f[1].toLowerCase());
+				if (base === undefined) { throw new Error(`Constraint dependency "${f[1]}" must already be defined.`); }
+				const a = zmNumber(f[2]);
+				if (a === 0) { throw new Error('A zero constraint multiplier must be specified as a constant instead.'); }
+				value = a * base + zmNumber(f[3]);
+			} else { value = zmNumber(f[1]); }
+			if (!Number.isFinite(value)) { throw new Error('Non-finite Z-matrix symbol value.'); }
+			symbols.set(key, value);
+		} catch (error) { throw new Error(`Z-matrix line ${definition.line}: ${error instanceof Error ? error.message : error}`); }
+	}
+	const atoms: Atom[] = [];
+	const symbolKinds = new Map<string, 'angle' | 'length'>();
+	const molecules = new Map<number, Atom[]>();
+	const azimuths = new Map<number, number>();
+	for (const row of rows) {
+		try {
+			const f = row.fields;
+			const molecular = row.molecule !== undefined;
+			const offset = molecular ? 4 : 1;
+			if (f.length < offset + 3) { throw new Error('Incomplete coordinate record.'); }
+			if (!/^\d+$/.test(f[0]) || !species.has(Number(f[0]))) { throw new Error(`Unknown species index "${f[0]}".`); }
+			const speciesIndex = Number(f[0]);
+			const atomicNumber = atomicNumbers.get(speciesIndex);
+			const ghost = atomicNumber !== undefined && atomicNumber < 0 && atomicNumber > -201;
+			const values = f.slice(offset, offset + 3).map((t, k) => {
+				if (!isPlainNumberToken(t)) {
+					const kind = molecular && row.local > 1 && k > 0 ? 'angle' : 'length';
+					const key = t.toLowerCase();
+					if (symbolKinds.has(key) && symbolKinds.get(key) !== kind) { throw new Error(`Symbol "${t}" is used as both a length and an angle.`); }
+					symbolKinds.set(key, kind);
+				}
+				return zmValue(t, symbols, false);
+			}) as Vec3;
+			const atom: Atom = {
+				element: (ghost && atomicNumberToSymbol(-atomicNumber!)) || species.get(speciesIndex)!,
+				position: [0, 0, 0], fdfSpeciesIndex: speciesIndex, sourceIndex: atoms.length + 1, ghost,
+				zmatrix: { context: molecular ? `Molecule ${row.molecule} · local atom ${row.local}` : `${row.mode} input`, entries: [] }
+			};
+			const entries = atom.zmatrix!.entries;
+			// Flags describe optimization in these coordinates, never Cartesian-axis constraints.
+			const flags = f.slice(offset + 3, offset + 6);
+			if (flags.length && (flags.length !== 3 || flags.some(t => !/^[01]$/.test(t)))) { throw new Error('Expected three Z-matrix variation flags (0 or 1).'); }
+			if (!molecular || row.local === 1) {
+				if (molecular && f.slice(1, 4).some(t => t !== '0')) { throw new Error('The first molecule atom must use references 0 0 0.'); }
+				atom.position = row.mode === 'fractional' ? fractionalToCartesian(values, lattice) : scaleVector(values, row.mode === 'scaled' ? latticeConstant : lengthUnit);
+				if (row.mode === 'fractional') { atom.fractionalPosition = values; }
+				for (let k = 0; k < 3; k++) {
+					entries.push(zmEntry(`${row.mode === 'cartesian' ? '' : row.mode + ' '}${['x', 'y', 'z'][k]}`, f[offset + k], row.mode === 'cartesian' ? atom.position[k] : values[k], row.mode === 'cartesian' ? 'Å' : ''));
+				}
+			} else {
+				const refs = f.slice(1, 4).map(t => /^\d+$/.test(t) ? Number(t) : NaN);
+				const previous = molecules.get(row.molecule!) ?? [];
+				const needed = Math.min(row.local - 1, 3);
+				if (refs.slice(0, needed).some(i => !Number.isInteger(i) || i < 1 || i >= row.local) || new Set(refs.slice(0, needed)).size !== needed || refs.slice(needed).some(i => i !== 0)) {
+					throw new Error('Invalid molecule-local reference indices.');
+				}
+				const [r, a, t] = [values[0] * lengthUnit, values[1] * angleUnit, values[2] * angleUnit];
+				zmCheckInternal(r);
+				const i = previous[refs[0] - 1].position;
+				entries.push(zmEntry(`Distance ${row.local}–${refs[0]}`, f[4], r, 'Å'));
+				if (row.local === 2) {
+					if (a < 0 || a > Math.PI) { throw new Error('Polar angle must be between 0 and 180 degrees.'); }
+					atom.position = zmAdd(i, [r * Math.sin(a) * Math.cos(t), r * Math.sin(a) * Math.sin(t), r * Math.cos(a)]);
+					azimuths.set(row.molecule!, t);
+					entries.push(zmEntry('Polar angle', f[5], a / ZM_DEG, '°'), zmEntry('Azimuth', f[6], t / ZM_DEG, '°'));
+				} else {
+					const j = previous[refs[1] - 1].position;
+					atom.position = row.local === 3 ? zmThirdSiesta(i, j, r, a, t, azimuths.get(row.molecule!)! - (refs[0] === 1 ? Math.PI : 0)) : zmInternal(i, j, previous[refs[2] - 1].position, r, a, t);
+					entries.push(zmEntry(`Angle ${row.local}–${refs[0]}–${refs[1]}`, f[5], a / ZM_DEG, '°'));
+					entries.push(zmEntry(row.local === 3 ? 'Orientation angle' : `Dihedral ${row.local}–${refs.join('–')}`, f[6], t / ZM_DEG, '°'));
+				}
+			}
+			if (!atom.position.every(Number.isFinite)) { throw new Error('Non-finite converted coordinates.'); }
+			atoms.push(atom);
+			if (molecular) { const group = molecules.get(row.molecule!) ?? []; group.push(atom); molecules.set(row.molecule!, group); }
+		} catch (error) { throw new Error(`Z-matrix line ${row.line}: ${error instanceof Error ? error.message : error}`); }
+	}
+	const count = getFdfStringValue(lines, 'NumberOfAtoms');
+	if (count && Number(count) !== atoms.length) { throw new Error(`Z-matrix: NumberOfAtoms is ${count}, but found ${atoms.length} atoms.`); }
+	return atoms;
 }

@@ -21,7 +21,7 @@ Install directly from the VS Marketplace:
 - Visualization of **SIESTA** (`.fdf`) structures
 - Visualization of **Quantum ESPRESSO** (`.in`) structures
 - Visualization of **Gaussian** (`.gjf`) structures
-- Independent previews for different files; opening preview again reveals that file's existing preview
+- Independent previews for different files
 - Automatic live refresh on file changes
 - Atom hover inspection with coordinate and constraint information
 - Highlighting for constrained atoms
@@ -35,28 +35,25 @@ Install directly from the VS Marketplace:
 - Supports multi-frame trajectory playback for `XDATCAR` and stacked `.vasp` files
 - Files are recognized when their names contain `POSCAR`, `CONTCAR`, or `XDATCAR` (case-insensitive)
 - Supports coordinate constraints (`Selective Dynamics`)
-- Supports scalar, negative-volume, and three-component scaling factors; stacked `.vasp` frames retain their own lattice
 
 #### SIESTA (`.fdf`)
-- Z-matrix-based structure definitions are not currently supported
+- Supports Z-matrix input; Z-matrix constraints are not visualized
 - Supports coordinate constraints defined through `Geometry.Constraints`
-- Recognizes equivalent FDF labels regardless of case or `-`, `_`, and `.` punctuation; ordinary elements are identified by their atomic numbers, independently of species labels
 - Constraints that do not act on individual atoms (`center`, `rigid`, `molecule`, `rigid-max`, `molecule-max`, `cell-angle`, `cell-vector`, `stress`, `routine`) are not currently visualized
 
 #### Quantum ESPRESSO (`.in`)
 - Nonzero `ibrav` values are not currently supported; explicit `CELL_PARAMETERS` are required
 - Space-group expansion (`crystal_sg`) is not currently supported; all atoms must be explicitly listed in `ATOMIC_POSITIONS`
 - Supports coordinate constraints (`if_pos`)
-- Supports inline namelist assignments and derives `alat` from the first cell vector when no lattice parameter is supplied
 
 #### Gaussian (`.gjf`)
-- Supports Cartesian-coordinate molecule specifications only
-- Z-matrix and other internal-coordinate molecule specifications are not currently supported
+- Supports Cartesian, Z-matrix, and mixed-coordinate input; Z-matrix constraints are not visualized
+- The alternate two-angle Z-matrix format is not supported
+- Dummy atoms are hidden; ghost atoms are shown and identified on hover
 - Supports coordinate constraints (`freeze-code`)
 - Supports periodic translation vectors (`TV`)
 - Trailing atom indices, MM atom types, charges, isotopes, fragments, and other parameters are ignored for visualization
 - Explicit connectivity information is not used for bond generation
-- If an unsupported or invalid molecule row is encountered after some atoms have been read, the partial structure remains visible with a warning identifying the line where parsing stopped
 
 ## Planned Features
 
@@ -64,6 +61,10 @@ Install directly from the VS Marketplace:
 - Additional structure format support (`.cif`, `.xyz`, etc.)
 
 ## Release Notes
+
+### 0.4.0
+- Added SIESTA and Gaussian Z-matrix support
+- Added Gaussian dummy and ghost center support
 
 ### 0.3.3
 - Added support for multiple independent preview windows
