@@ -37,9 +37,10 @@ Install directly from the VS Marketplace:
 - Supports coordinate constraints (`Selective Dynamics`)
 
 #### SIESTA (`.fdf`)
-- Supports Z-matrix input with geometry and constraint labels on hover
-- Supports coordinate constraints defined through `Geometry.Constraints`
-- Constraints that do not act on individual atoms (`center`, `rigid`, `molecule`, `rigid-max`, `molecule-max`, `cell-angle`, `cell-vector`, `stress`, `routine`) are not currently visualized
+- Supports both Z-matrix and Cartesian/fractional coordinates
+- Shows Z-matrix geometry (distance/angle/torsion) labels and constraint status on hover
+- Supports Cartesian/fractional constraints defined through `Geometry.Constraints`
+- Cartesian/fractional constraints that do not act on individual atoms (`center`, `rigid`, `molecule`, `rigid-max`, `molecule-max`, `cell-angle`, `cell-vector`, `stress`, `routine`) are not currently visualized
 
 #### Quantum ESPRESSO (`.in`)
 - Nonzero `ibrav` values are not currently supported; explicit `CELL_PARAMETERS` are required
@@ -47,11 +48,12 @@ Install directly from the VS Marketplace:
 - Supports coordinate constraints (`if_pos`)
 
 #### Gaussian (`.gjf`)
-- Supports Cartesian, Z-matrix, and mixed-coordinate input, with Z-matrix geometry and constraint labels on hover
-- The alternate two-angle Z-matrix format is not supported
-- Dummy atoms are hidden; ghost atoms are shown and identified on hover
-- Supports coordinate constraints (`freeze-code`)
+- Supports Cartesian, Z-matrix, and mixed-coordinate input
+- Shows Z-matrix geometry (distance/angle/torsion) labels and constraint status on hover
+- Supports `freeze-code` coordinate constraints
 - Supports periodic translation vectors (`TV`)
+- Dummy atoms are hidden; ghost atoms are shown and identified on hover
+- The alternate two-angle Z-matrix format is not supported
 - Trailing atom indices, MM atom types, charges, isotopes, fragments, and other parameters are ignored for visualization
 - Explicit connectivity information is not used for bond generation
 
@@ -63,7 +65,7 @@ Install directly from the VS Marketplace:
 ## Release Notes
 
 ### 0.4.1
-- Added Z-matrix geometry labels and constraint status on hover
+- Added Z-matrix geometry (distance/angle/torsion) labels and constraint status on hover
 
 ### 0.4.0
 - Added SIESTA and Gaussian Z-matrix support
