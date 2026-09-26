@@ -37,7 +37,7 @@ Install directly from the VS Marketplace:
 - Supports coordinate constraints (`Selective Dynamics`)
 
 #### SIESTA (`.fdf`)
-- Supports Z-matrix input; Z-matrix constraints are not visualized
+- Supports Z-matrix input with geometry and constraint labels on hover
 - Supports coordinate constraints defined through `Geometry.Constraints`
 - Constraints that do not act on individual atoms (`center`, `rigid`, `molecule`, `rigid-max`, `molecule-max`, `cell-angle`, `cell-vector`, `stress`, `routine`) are not currently visualized
 
@@ -47,7 +47,7 @@ Install directly from the VS Marketplace:
 - Supports coordinate constraints (`if_pos`)
 
 #### Gaussian (`.gjf`)
-- Supports Cartesian, Z-matrix, and mixed-coordinate input; Z-matrix constraints are not visualized
+- Supports Cartesian, Z-matrix, and mixed-coordinate input, with Z-matrix geometry and constraint labels on hover
 - The alternate two-angle Z-matrix format is not supported
 - Dummy atoms are hidden; ghost atoms are shown and identified on hover
 - Supports coordinate constraints (`freeze-code`)
@@ -62,9 +62,12 @@ Install directly from the VS Marketplace:
 
 ## Release Notes
 
+### 0.4.1
+- Added Z-matrix geometry labels and constraint status on hover
+
 ### 0.4.0
 - Added SIESTA and Gaussian Z-matrix support
-- Added Gaussian dummy and ghost center support
+- Added Gaussian dummy and ghost atoms support
 
 ### 0.3.3
 - Added support for multiple independent preview windows

@@ -11,6 +11,9 @@ let currentLatticeSignature;
 let statusElement;
 let latestStructure;
 let hoverElement;
+let hoverOverlay;
+let hoverOverlayData;
+let hoveredOverlayAtom;
 let raycaster;
 let pointer;
 let atomMeshes = [];
@@ -183,13 +186,14 @@ function initViewer() {
 
 	hoverElement = document.createElement('pre');
 	hoverElement.style.position = 'absolute';
+	hoverElement.style.zIndex = '10';
 	hoverElement.style.right = '16px';
 	hoverElement.style.bottom = '16px';
 	hoverElement.style.margin = '0';
 	hoverElement.style.padding = '8px 10px';
 	hoverElement.style.whiteSpace = 'pre-wrap';
 	hoverElement.style.fontFamily = 'var(--vscode-editor-font-family)';
-	hoverElement.style.fontSize = '12px';
+	hoverElement.style.fontSize = '11px';
 	hoverElement.style.color = 'var(--vscode-foreground)';
 	hoverElement.style.background = 'rgba(0, 0, 0, 0.70)';
 	hoverElement.style.border = '1px solid rgba(255, 255, 255, 0.25)';
@@ -306,6 +310,7 @@ function createTrackballControls() {
 	trackballControls.staticMoving = true;
 	trackballControls.dynamicDampingFactor = 0.0;
 	trackballControls.target.set(0, 0, 0);
+	trackballControls.addEventListener('start', clearHoverInfo);
 	return trackballControls;
 }
 
@@ -314,6 +319,7 @@ function animate(timestamp) {
 	updateTrajectoryPlayback(timestamp);
 	controls.update();
 	renderer.render(scene, camera);
+	updateHoverOverlay();
 	renderAxisViewer();
 }
 
@@ -707,6 +713,7 @@ function updatePlayPauseButton() {
 }
 
 function renderStructure(structure, options = {}) {
+	clearHoverInfo();
 	const preserveCamera = options.preserveCamera === true;
 	const previousCameraState = preserveCamera ? captureCameraState() : undefined;
 	updateFrameLabel();
@@ -868,6 +875,7 @@ function updateAtomMeshAppearance(mesh, atom) {
 }
 
 function handlePointerMove(event) {
+	if (event.buttons) { clearHoverInfo(); return; }
 	if (!camera || !raycaster || atomMeshes.length === 0) {
 		return;
 	}
@@ -895,6 +903,181 @@ function handlePointerMove(event) {
 	mesh.material.emissive = new THREE.Color(0x333333);
 
 	showAtomHoverInfo(atom, atomIndex, currentFrameIndex, frameStructure?.coordinateMode, frameStructure?.sourceFormat);
+	showHoverOverlay(atom);
+}
+
+// Geometry is prepared only when the hovered atom changes. Labels and guides
+// are projected into a pointer-transparent SVG layer as the camera moves.
+function buildZMatrixOverlay(atom) {
+	const guides = [], labels = [];
+	if (!atom.zmatrix) { return { guides, labels }; }
+	const pointKey = p => `${p.label}:${p.position.join(',')}`;
+	const seen = new Set();
+	const addIndex = p => {
+		const key = pointKey(p);
+		if (seen.has(key)) { return; }
+		seen.add(key);
+		const text = p.label === 'xy projection' ? 'xy' : p.label === 'auxiliary reference' ? 'z' : p.label.replace(/ \(local\)$/, '');
+		labels.push({ position: p.position, text, fixed: false, index: true });
+	};
+	addIndex({ position: atom.position, label: atom.zmatrix.indexLabel ?? String(atom.sourceIndex) });
+	const vec = p => new THREE.Vector3(...p);
+	const addGuide = (points, fixed, dashed = true) => guides.push({ points: points.map(p => p.toArray()), fixed, dashed });
+	const addArc = (center, start, axis, sweep, radius, fixed) => {
+		const steps = Math.max(2, Math.ceil(Math.abs(sweep) * 16));
+		const points = Array.from({ length: steps + 1 }, (_, n) => start.clone().applyAxisAngle(axis, sweep * n / steps).multiplyScalar(radius).add(center));
+		addGuide(points, fixed, false);
+		return start.clone().applyAxisAngle(axis, sweep / 2).multiplyScalar(radius).add(center);
+	};
+	for (const entry of atom.zmatrix.entries) {
+		if (!entry.geometry) { continue; }
+		const { kind, points } = entry.geometry;
+		points.forEach(addIndex);
+		const p = points.map(p => vec(p.position));
+		const fixed = entry.freedom?.state === 'fixed';
+		let anchor;
+		if (kind === 'distance') {
+			addGuide(p, fixed, false);
+			anchor = p[0].clone().add(p[1]).multiplyScalar(0.5);
+		} else if (kind === 'angle') {
+			const u = p[0].clone().sub(p[1]), v = p[2].clone().sub(p[1]);
+			const radius = Math.min(u.length(), v.length()) * 0.38;
+			if (radius < 1e-10) { continue; }
+			u.normalize(); v.normalize();
+			let axis = new THREE.Vector3().crossVectors(u, v);
+			let sweep = Math.acos(THREE.MathUtils.clamp(u.dot(v), -1, 1));
+			if (entry.geometry.axis) {
+				axis = vec(entry.geometry.axis);
+				sweep = (entry.value % 360) * Math.PI / 180;
+			} else if (axis.lengthSq() < 1e-16) {
+				axis.crossVectors(u, Math.abs(u.x) < 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0));
+			}
+			axis.normalize();
+			addGuide([p[0], p[1], p[2]], fixed);
+			anchor = addArc(p[1], u, axis, sweep, radius, fixed);
+		} else {
+			const axis = p[1].clone().sub(p[2]);
+			if (axis.lengthSq() < 1e-16) { continue; }
+			axis.normalize();
+			const start = p[3].clone().sub(p[2]);
+			start.addScaledVector(axis, -start.dot(axis));
+			const finish = p[0].clone().sub(p[1]);
+			finish.addScaledVector(axis, -finish.dot(axis));
+			if (start.lengthSq() < 1e-16 || finish.lengthSq() < 1e-16) { continue; }
+			const radius = Math.min(start.length(), finish.length(), p[1].distanceTo(p[2])) * 0.4;
+			const center = p[1].clone().add(p[2]).multiplyScalar(0.5);
+			start.normalize(); finish.normalize();
+			addGuide(p, fixed);
+			addGuide([p[0], p[2]], fixed);
+			addGuide([p[1], p[3]], fixed);
+			anchor = addArc(center, start, axis, (entry.value % 360) * Math.PI / 180, radius, fixed);
+		}
+		const symbolic = !/^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][-+]?\d+)?$/.test(entry.source);
+		const value = entry.value.toFixed(entry.unit === '°' ? 1 : 3);
+		const prefix = symbolic ? entry.source + ' = ' : '';
+		labels.push({ position: anchor.toArray(), text: `${prefix}${value}${entry.unit === '°' ? '°' : ' ' + entry.unit}`, prefix, fixed, index: false });
+	}
+	return { guides, labels };
+}
+
+function clearHoverOverlay() {
+	hoveredOverlayAtom = undefined;
+	hoverOverlayData = undefined;
+	if (hoverOverlay) { hoverOverlay.replaceChildren(); }
+}
+
+function showHoverOverlay(atom) {
+	if (hoveredOverlayAtom === atom) { return; }
+	clearHoverOverlay();
+	if (!atom.zmatrix) { return; }
+	hoveredOverlayAtom = atom;
+	if (!hoverOverlay) {
+		hoverOverlay = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+		hoverOverlay.setAttribute('aria-hidden', 'true');
+		Object.assign(hoverOverlay.style, { position: 'absolute', inset: '0', width: '100%', height: '100%', pointerEvents: 'none', zIndex: '5', overflow: 'hidden' });
+		document.body.appendChild(hoverOverlay);
+	}
+	const make = tag => document.createElementNS('http://www.w3.org/2000/svg', tag);
+	const data = buildZMatrixOverlay(atom);
+	for (const guide of data.guides) {
+		const line = make('polyline');
+		line.setAttribute('fill', 'none');
+		line.setAttribute('stroke', guide.fixed ? '#999' : '#f0f0f0');
+		line.setAttribute('stroke-width', guide.dashed ? '2' : '2.5');
+		line.setAttribute('stroke-opacity', '0.95');
+		if (guide.dashed) { line.setAttribute('stroke-dasharray', '4 4'); }
+		hoverOverlay.appendChild(line);
+		guide.element = line;
+	}
+	for (const label of data.labels) {
+		const group = make('g'), box = make('rect'), text = make('text');
+		const color = label.fixed ? '#999' : '#f0f0f0';
+		box.setAttribute('fill', '#101010'); box.setAttribute('fill-opacity', '0.7'); box.setAttribute('rx', '3');
+		text.setAttribute('fill', color); text.setAttribute('font-family', 'monospace'); text.setAttribute('font-size', '10');
+		text.setAttribute('text-anchor', 'middle'); text.setAttribute('dominant-baseline', 'central');
+		if (label.prefix) {
+			const name = make('tspan'), value = make('tspan');
+			name.setAttribute('font-size', '9');
+			name.textContent = label.prefix;
+			value.textContent = label.text.slice(label.prefix.length);
+			text.append(name, value);
+		} else {
+			text.textContent = label.text;
+		}
+		group.append(box, text); hoverOverlay.appendChild(group);
+		Object.assign(label, { element: group, box, textElement: text });
+	}
+	hoverOverlayData = data;
+	updateHoverOverlay();
+}
+
+function updateHoverOverlay() {
+	if (!hoverOverlayData || !camera || !renderer) { return; }
+	const rect = renderer.domElement.getBoundingClientRect();
+	if (!rect.width || !rect.height) { return; }
+	currentStructureGroup?.updateWorldMatrix(true, false);
+	const project = position => {
+		const p = new THREE.Vector3(...position);
+		if (currentStructureGroup) { p.applyMatrix4(currentStructureGroup.matrixWorld); }
+		p.project(camera);
+		return Number.isFinite(p.x + p.y + p.z) && p.z >= -1 && p.z <= 1 ? { x: (p.x + 1) * rect.width / 2 + rect.left, y: (1 - p.y) * rect.height / 2 + rect.top } : undefined;
+	};
+	for (const guide of hoverOverlayData.guides) {
+		const points = guide.points.map(project);
+		const visible = points.every(Boolean);
+		guide.element.style.display = visible ? '' : 'none';
+		if (visible) { guide.element.setAttribute('points', points.map(p => `${p.x},${p.y}`).join(' ')); }
+	}
+	const placed = [];
+	// Keep atom indices anchored first; only nudge crowded labels, by at most 20px.
+	const offsets = [{ x: 0, y: 0 }];
+	for (let y = -20; y <= 20; y += 4) {
+		for (let x = -20; x <= 20; x += 4) {
+			if ((x || y) && x * x + y * y <= 400) { offsets.push({ x, y }); }
+		}
+	}
+	offsets.sort((a, b) => a.x * a.x + a.y * a.y - b.x * b.x - b.y * b.y);
+	for (const label of [...hoverOverlayData.labels].sort((a, b) => Number(b.index) - Number(a.index))) {
+		const p = project(label.position);
+		if (!p || p.x < rect.left || p.x > rect.right || p.y < rect.top || p.y > rect.bottom) {
+			label.element.style.display = 'none'; continue;
+		}
+		label.element.style.display = '';
+		const prefixLength = label.prefix?.length ?? 0;
+		const width = (label.text.length - prefixLength) * 6.1 + prefixLength * 5.5 + 6, height = 17;
+		let box, bestOverlap = Infinity;
+		for (const offset of offsets) {
+			const candidate = { x: p.x + offset.x - width / 2, y: p.y + offset.y - height / 2, width, height };
+			const overlap = placed.reduce((total, other) => total +
+				Math.max(0, Math.min(candidate.x + width, other.x + other.width) - Math.max(candidate.x, other.x) + 2) *
+				Math.max(0, Math.min(candidate.y + height, other.y + other.height) - Math.max(candidate.y, other.y) + 2), 0);
+			if (overlap < bestOverlap) { box = candidate; bestOverlap = overlap; }
+			if (overlap === 0) { break; }
+		}
+		placed.push(box);
+		for (const [key, value] of Object.entries(box)) { label.box.setAttribute(key, String(value)); }
+		label.textElement.setAttribute('x', String(box.x + width / 2)); label.textElement.setAttribute('y', String(box.y + height / 2));
+	}
 }
 
 function resetAtomHoverAppearance() {
@@ -907,6 +1090,7 @@ function resetAtomHoverAppearance() {
 }
 
 function clearHoverInfo() {
+	clearHoverOverlay();
 	resetAtomHoverAppearance();
 	if (hoverElement) {
 		hoverElement.style.display = 'none';
@@ -937,7 +1121,10 @@ function showAtomHoverInfo(atom, atomIndex, frameIndex, coordinateMode, sourceFo
 			lines.push('', atom.zmatrix.context?.startsWith('Molecule') ? 'Z-matrix — local indices' : 'Z-matrix');
 			for (const entry of atom.zmatrix.entries) {
 				const symbolic = !/^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][-+]?\d+)?$/.test(entry.source);
-				lines.push(`${entry.label}: ${symbolic ? entry.source + ' → ' : ''}${entry.value.toFixed(6)}${entry.unit === '°' ? '°' : entry.unit ? ' ' + entry.unit : ''}`);
+				const freedom = entry.freedom;
+				const status = !freedom ? '' : freedom.root ? `linked to ${freedom.root}; ${freedom.state === 'fixed' ? 'fixed' : 'partially free'}` : freedom.state;
+				lines.push(`${entry.label}: ${symbolic ? entry.source + ' → ' : ''}${entry.value.toFixed(6)}${entry.unit === '°' ? '°' : entry.unit ? ' ' + entry.unit : ''}${status ? ' (' + status + ')' : ''}`);
+				if (freedom?.relation) { lines.push(`  ${freedom.relation}`); }
 			}
 		}
 	}

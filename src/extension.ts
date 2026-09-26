@@ -1820,6 +1820,8 @@ function parseGaussianMoleculeSpecification(
 	const atoms: Atom[] = [];
 	const translationVectors: Vec3[] = [];
 	let warning: string | undefined;
+	let cartesianCenters = 0;
+	let shortInternal: { sourceIndex: number; line: number } | undefined;
 	for (let index = startIndex; index < end; index++) {
 		const line = stripGaussianComment(rawLines[index]).trim();
 		if (!line) { continue; }
@@ -1833,6 +1835,13 @@ function parseGaussianMoleculeSpecification(
 		try {
 			const center = gaussianCenter(gaussianFields(line), centers, symbols, units);
 			if (!center.position.every(Number.isFinite)) { throw new Error('Non-finite converted coordinates.'); }
+			// Numeric Cartesian rows have no Z-matrix details; symbolic ones
+			// carry the Cartesian-input context. Count dummy/ghost references too.
+			if (!center.zmatrix || center.zmatrix.context === 'Cartesian input') {
+				cartesianCenters++;
+			} else if (center.zmatrix.entries.length === 1 || center.zmatrix.entries.length === 2) {
+				shortInternal ??= { sourceIndex: centers.length + 1, line: index + 1 };
+			}
 			centers.push(center);
 			if (!center.dummy) { atoms.push(center); }
 		} catch (error) {
@@ -1841,6 +1850,9 @@ function parseGaussianMoleculeSpecification(
 			warning = `Partial structure: only the first ${atoms.length} atom(s) are shown. Gaussian geometry at line ${index + 1}, source atom ${centers.length + 1}: ${reason} This atom and the remaining atoms were not read.`;
 			break;
 		}
+	}
+	if (cartesianCenters > 1 && shortInternal) {
+		throw new Error(`Unsupported mixed Gaussian geometry: source atom ${shortInternal.sourceIndex} (line ${shortInternal.line}) uses only a bond length or a bond length and angle alongside multiple Cartesian centers. Define three noncollinear Cartesian reference centers before using full internal-coordinate definitions.`);
 	}
 	return { atoms, translationVectors, warning };
 }
@@ -2402,14 +2414,39 @@ function getNonce() {
 }
 /* Z-matrix geometry and source metadata                                      */
 
+interface ZMatrixFreedom {
+	state: 'free' | 'fixed' | 'linked';
+	root?: string;
+	relation?: string;
+}
+
+interface ZMatrixSymbols extends Map<string, number> {
+	freedoms: Map<string, ZMatrixFreedom>;
+}
+
+interface ZMatrixPoint {
+	position: Vec3;
+	label: string;
+	auxiliary?: boolean;
+}
+
+interface ZMatrixGeometry {
+	kind: 'distance' | 'angle' | 'dihedral';
+	points: ZMatrixPoint[];
+	axis?: Vec3;
+}
+
 interface ZMatrixEntry {
 	label: string;
 	source: string;
 	value: number;
 	unit: string;
+	freedom?: ZMatrixFreedom;
+	geometry?: ZMatrixGeometry;
 }
 
 interface ZMatrixInfo {
+	indexLabel?: string;
 	context?: string;
 	entries: ZMatrixEntry[];
 }
@@ -2445,6 +2482,20 @@ function zmValue(token: string, symbols: Map<string, number>, signed = true): nu
 function zmEntry(label: string, source: string, value: number, unit: string): ZMatrixEntry {
 	return { label, source, value, unit };
 }
+function zmSymbols(): ZMatrixSymbols {
+	return Object.assign(new Map<string, number>(), { freedoms: new Map<string, ZMatrixFreedom>() });
+}
+function zmFreedom(source: string, symbols: ZMatrixSymbols, literal: 'free' | 'fixed'): ZMatrixFreedom {
+	return isPlainNumberToken(source) ? { state: literal } :
+		{ ...symbols.freedoms.get(source.replace(/^[+-]/, '').toLowerCase())! };
+}
+function zmPoint(atom: Atom, label = String(atom.sourceIndex)): ZMatrixPoint {
+	return { position: [...atom.position], label };
+}
+function zmGeometry(points: ZMatrixPoint[], kind?: ZMatrixGeometry['kind']): ZMatrixGeometry {
+	return { kind: kind ?? (points.length === 2 ? 'distance' : points.length === 3 ? 'angle' : 'dihedral'), points };
+}
+
 function zmCheckInternal(r: number, angle?: number) {
 	if (!(r > 0)) { throw new Error('Z-matrix distance must be positive.'); }
 	if (angle !== undefined && !(angle > 0 && angle < Math.PI)) {
@@ -2523,8 +2574,8 @@ function gaussianUnits(rawLines: string[]): { length: number; angle: number } {
 	return result;
 }
 
-function gaussianSymbols(rawLines: string[], start: number): Map<string, number> {
-	const symbols = new Map<string, number>();
+function gaussianSymbols(rawLines: string[], start: number): ZMatrixSymbols {
+	const symbols = zmSymbols();
 	const separator = stripGaussianComment(rawLines[start] ?? '').trim();
 	if (separator && !/^(variables|constants)\s*:?$/i.test(separator)) { return symbols; }
 	// A blank line or Variables: ends geometry and starts variables. A second
@@ -2544,13 +2595,14 @@ function gaussianSymbols(rawLines: string[], start: number): Map<string, number>
 		const key = match[1].toLowerCase();
 		if (symbols.has(key)) { throw new Error(`Duplicate Z-matrix variable "${match[1]}" at line ${i + 1}.`); }
 		symbols.set(key, zmNumber(match[2]));
+		symbols.freedoms.set(key, { state: constants ? 'fixed' : 'free' });
 	}
 	return symbols;
 }
 
 interface GaussianCenter extends Atom { dummy?: boolean; label: string; }
 
-function gaussianCenter(fields: string[], centers: GaussianCenter[], symbols: Map<string, number>, units: { length: number; angle: number }): GaussianCenter {
+function gaussianCenter(fields: string[], centers: GaussianCenter[], symbols: ZMatrixSymbols, units: { length: number; angle: number }): GaussianCenter {
 	const label = fields[0] === '-1' ? '-1' : fields[0].split('(')[0].split('-')[0];
 	const dummy = /^x\d*$/i.test(label) || label === '-1';
 	const ghost = /-bq(?:\(|$)/i.test(fields[0]) || /^bq\d*$/i.test(label);
@@ -2558,6 +2610,15 @@ function gaussianCenter(fields: string[], centers: GaussianCenter[], symbols: Ma
 	if (!spec && !dummy && !ghost) { throw new Error(`Invalid Gaussian atom "${fields[0]}".`); }
 	const sourceIndex = centers.length + 1;
 	const atom: GaussianCenter = { element: dummy ? 'X' : /^bq\d*$/i.test(label) ? 'Bq' : spec?.element ?? 'Bq', label, sourceIndex, sourceLabel: fields[0], ghost, dummy, position: [0, 0, 0] };
+	const finish = (references: GaussianCenter[]): GaussianCenter => {
+		const points = [atom, ...references].map(c => zmPoint(c, `${c.sourceIndex}${c.dummy ? ' (dummy)' : ''}`));
+		atom.zmatrix!.indexLabel = String(sourceIndex);
+		atom.zmatrix!.entries.forEach((entry, n) => {
+			entry.freedom = zmFreedom(entry.source, symbols, 'fixed');
+			entry.geometry = zmGeometry(points.slice(0, n + 2));
+		});
+		return atom;
+	};
 	const val = (token: string) => zmValue(token, symbols);
 	const reference = (token: string): GaussianCenter => {
 		if (/^\d+$/.test(token)) {
@@ -2583,7 +2644,7 @@ function gaussianCenter(fields: string[], centers: GaussianCenter[], symbols: Ma
 		atom.position = data.slice(0, 3).map(t => val(t) * units.length) as Vec3;
 		atom.selectiveDynamics = gaussianFreezeCodeToSelectiveDynamics(freeze);
 		if (data.slice(0, 3).some(t => !isPlainNumberToken(t))) {
-			atom.zmatrix = { context: 'Cartesian input', entries: data.slice(0, 3).map((t, n) => zmEntry(['x', 'y', 'z'][n], t, atom.position[n], 'Å')) };
+			atom.zmatrix = { indexLabel: String(sourceIndex), context: 'Cartesian input', entries: data.slice(0, 3).map((t, n) => ({ ...zmEntry(['x', 'y', 'z'][n], t, atom.position[n], 'Å'), freedom: zmFreedom(t, symbols, freeze !== undefined && freeze < 0 ? 'fixed' : 'free') })) };
 		}
 		return atom;
 	}
@@ -2596,23 +2657,23 @@ function gaussianCenter(fields: string[], centers: GaussianCenter[], symbols: Ma
 		if (format !== 0) { throw new Error(`Unsupported Z-matrix format code ${format}.`); }
 	}
 	atom.zmatrix = { entries: [] }; // Internal-coordinate freeze flags are not x/y/z locks.
-	if (count === 0) { return atom; }
+	if (count === 0) { return finish([]); }
 	const i = reference(data[0]);
 	const r = val(data[1]) * units.length;
 	zmCheckInternal(r);
 	atom.zmatrix.entries.push(zmEntry(`Distance ${sourceIndex}–${data[0]}`, data[1], r, 'Å'));
-	if (count === 1) { atom.position = zmAdd(i.position, [0, 0, r]); return atom; }
+	if (count === 1) { atom.position = zmAdd(i.position, [0, 0, r]); return finish([i]); }
 	const j = reference(data[2]);
 	if (i === j) { throw new Error('Z-matrix references must be distinct.'); }
 	const a = val(data[3]) * units.angle;
 	atom.zmatrix.entries.push(zmEntry(`Angle ${sourceIndex}–${data[0]}–${data[2]}`, data[3], a / ZM_DEG, '°'));
-	if (count === 2) { atom.position = zmThirdGaussian(i.position, j.position, r, a); return atom; }
+	if (count === 2) { atom.position = zmThirdGaussian(i.position, j.position, r, a); return finish([i, j]); }
 	const k = reference(data[4]);
 	if (k === i || k === j) { throw new Error('Z-matrix references must be distinct.'); }
 	const b = val(data[5]) * units.angle;
 	atom.position = zmInternal(i.position, j.position, k.position, r, a, b);
 	atom.zmatrix.entries.push(zmEntry(`Dihedral ${sourceIndex}–${data[0]}–${data[2]}–${data[4]}`, data[5], b / ZM_DEG, '°'));
-	return atom;
+	return finish([i, j, k]);
 }
 
 interface SiestaZRow {
@@ -2634,7 +2695,7 @@ function parseSiestaZmatrix(text: string, lines: FdfLine[], lattice: [Vec3, Vec3
 	const raw = text.split(/\r?\n/);
 	const start = raw.findIndex(line => /^%block\s+/i.test(line.trim()) && normalizeFdfLabel(line.trim().split(/\s+/)[1]) === 'zmatrix');
 	const rows: SiestaZRow[] = [];
-	const definitions: { fields: string[]; line: number; constraint: boolean }[] = [];
+	const definitions: { fields: string[]; line: number; constraint: boolean; constant: boolean }[] = [];
 	let mode: SiestaZRow['mode'] = 'cartesian';
 	let section = '', molecule = 0, local = 0, ended = false;
 	for (let n = start + 1; n < raw.length; n++) {
@@ -2657,14 +2718,14 @@ function parseSiestaZmatrix(text: string, lines: FdfLine[], lattice: [Vec3, Vec3
 		if (/^(variables?|constants?|constraints?)$/i.test(line)) { section = header; continue; }
 		const fields = line.split(/[\s,=]+/);
 		if (section.startsWith('variable') || section.startsWith('constant') || section.startsWith('constraint')) {
-			definitions.push({ fields, line: n + 1, constraint: section.startsWith('constraint') });
+			definitions.push({ fields, line: n + 1, constraint: section.startsWith('constraint'), constant: section.startsWith('constant') });
 		} else if (section === 'coordinates' || section === 'molecule') {
 			rows.push({ fields, line: n + 1, mode, molecule: section === 'molecule' ? molecule : undefined, local: ++local });
 		} else { throw new Error(`Z-matrix: unsupported subsection or missing heading at line ${n + 1}.`); }
 	}
 	if (!ended) { throw new Error('Missing %endblock Zmatrix.'); }
 	if (!rows.length) { throw new Error('No atoms found in Z-matrix.'); }
-	const symbols = new Map<string, number>();
+	const symbols = zmSymbols();
 	for (const definition of definitions) {
 		try {
 			const f = definition.fields;
@@ -2678,7 +2739,16 @@ function parseSiestaZmatrix(text: string, lines: FdfLine[], lattice: [Vec3, Vec3
 				const a = zmNumber(f[2]);
 				if (a === 0) { throw new Error('A zero constraint multiplier must be specified as a constant instead.'); }
 				value = a * base + zmNumber(f[3]);
-			} else { value = zmNumber(f[1]); }
+				const parent = symbols.freedoms.get(f[1].toLowerCase())!;
+				symbols.freedoms.set(key, {
+					state: parent.state === 'fixed' ? 'fixed' : 'linked',
+					root: parent.root ?? f[1],
+					relation: `${f[0]} = ${f[2]} × ${f[1]} + ${f[3]}${parent.relation ? '; ' + parent.relation : ''}`
+				});
+			} else {
+				value = zmNumber(f[1]);
+				symbols.freedoms.set(key, { state: definition.constant ? 'fixed' : 'free' });
+			}
 			if (!Number.isFinite(value)) { throw new Error('Non-finite Z-matrix symbol value.'); }
 			symbols.set(key, value);
 		} catch (error) { throw new Error(`Z-matrix line ${definition.line}: ${error instanceof Error ? error.message : error}`); }
@@ -2709,7 +2779,7 @@ function parseSiestaZmatrix(text: string, lines: FdfLine[], lattice: [Vec3, Vec3
 			const atom: Atom = {
 				element: (ghost && atomicNumberToSymbol(-atomicNumber!)) || species.get(speciesIndex)!,
 				position: [0, 0, 0], fdfSpeciesIndex: speciesIndex, sourceIndex: atoms.length + 1, ghost,
-				zmatrix: { context: molecular ? `Molecule ${row.molecule} · local atom ${row.local}` : `${row.mode} input`, entries: [] }
+				zmatrix: { indexLabel: molecular ? `${row.local} (local)` : String(atoms.length + 1), context: molecular ? `Molecule ${row.molecule} · local atom ${row.local}` : `${row.mode} input`, entries: [] }
 			};
 			const entries = atom.zmatrix!.entries;
 			// Flags describe optimization in these coordinates, never Cartesian-axis constraints.
@@ -2737,12 +2807,41 @@ function parseSiestaZmatrix(text: string, lines: FdfLine[], lattice: [Vec3, Vec3
 					if (a < 0 || a > Math.PI) { throw new Error('Polar angle must be between 0 and 180 degrees.'); }
 					atom.position = zmAdd(i, [r * Math.sin(a) * Math.cos(t), r * Math.sin(a) * Math.sin(t), r * Math.cos(a)]);
 					azimuths.set(row.molecule!, t);
-					entries.push(zmEntry('Polar angle', f[5], a / ZM_DEG, '°'), zmEntry('Azimuth', f[6], t / ZM_DEG, '°'));
+					entries.push(zmEntry('Polar angle', f[5], a / ZM_DEG, '°'), zmEntry('Azimuthal angle', f[6], t / ZM_DEG, '°'));
 				} else {
 					const j = previous[refs[1] - 1].position;
 					atom.position = row.local === 3 ? zmThirdSiesta(i, j, r, a, t, azimuths.get(row.molecule!)! - (refs[0] === 1 ? Math.PI : 0)) : zmInternal(i, j, previous[refs[2] - 1].position, r, a, t);
 					entries.push(zmEntry(`Angle ${row.local}–${refs[0]}–${refs[1]}`, f[5], a / ZM_DEG, '°'));
-					entries.push(zmEntry(row.local === 3 ? 'Orientation angle' : `Dihedral ${row.local}–${refs.join('–')}`, f[6], t / ZM_DEG, '°'));
+					entries.push(zmEntry(`Dihedral ${row.local}–${refs.slice(0, row.local === 3 ? 2 : 3).join('–')}${row.local === 3 ? '–z' : ''}`, f[6], t / ZM_DEG, '°'));
+				}
+			}
+			entries.forEach((entry, k) => {
+				// SIESTA variation flags control literals; named symbols are
+				// controlled by their definitions, including dependency chains.
+				entry.freedom = zmFreedom(entry.source, symbols, flags[k] === '0' ? 'fixed' : 'free');
+			});
+			if (molecular && row.local > 1) {
+				const previous = molecules.get(row.molecule!)!;
+				const refs = f.slice(1, 4).map(Number);
+				const points = [zmPoint(atom, `${row.local} (local)`), ...refs.filter(n => n > 0).map(n => zmPoint(previous[n - 1], `${n} (local)`))];
+				entries[0].geometry = zmGeometry(points.slice(0, 2));
+				if (row.local === 2) {
+					const origin = points[1].position;
+					const r = entries[0].value;
+					const auxiliary = (offset: Vec3, label: string): ZMatrixPoint => ({ position: zmAdd(origin, offset), label, auxiliary: true });
+					const delta = zmSub(atom.position, origin);
+					entries[1].geometry = zmGeometry([auxiliary([0, 0, r], 'z'), points[1], points[0]], 'angle');
+					// At the pole, use the input azimuth to draw its reference ray.
+					const azimuth = values[2] * angleUnit;
+					const projected = Math.hypot(delta[0], delta[1]) > 1e-10 ? [delta[0], delta[1], 0] as Vec3 : [r * Math.cos(azimuth), r * Math.sin(azimuth), 0] as Vec3;
+					entries[2].geometry = { ...zmGeometry([auxiliary([r, 0, 0], 'x'), points[1], auxiliary(projected, 'xy projection')], 'angle'), axis: [0, 0, 1] };
+				} else {
+					entries[1].geometry = zmGeometry(points.slice(0, 3));
+					if (row.local === 3) {
+						const auxiliary = zmThirdSiesta(points[1].position, points[2].position, 1, Math.PI / 2, 0, azimuths.get(row.molecule!)! - (refs[0] === 1 ? Math.PI : 0));
+						points.push({ position: auxiliary, label: 'auxiliary reference', auxiliary: true });
+					}
+					entries[2].geometry = zmGeometry(points, 'dihedral');
 				}
 			}
 			if (!atom.position.every(Number.isFinite)) { throw new Error('Non-finite converted coordinates.'); }
